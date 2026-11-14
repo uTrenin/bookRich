@@ -813,3 +813,250 @@ async def test_runner_run_lifecycle_and_heartbeat(tmp_path: Path) -> None:
     event_types = [e["event_type"] for e in entries]
     assert "PAPER_FILL" in event_types
     assert "HEARTBEAT_STATS" in event_types
+
+
+@pytest.mark.asyncio
+async def test_dynamic_engine_adapter_pr2_signatures_and_runner_exposure_tracking(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from dataclasses import dataclass
+    from enum import StrEnum
+
+    class FakeRiskReason(StrEnum):
+        APPROVED = "APPROVED"
+        EVENT_EXPOSURE_EXCEEDED = "EVENT_EXPOSURE_EXCEEDED"
+
+    @dataclass(frozen=True)
+    class FakeRiskDecision:
+        approved: bool
+        reason: FakeRiskReason
+        detail: str
+        required_usdc: float = 0.0
+
+        def __bool__(self) -> bool:
+            return self.approved
+
+    captured_calls: dict[str, list[dict[str, Any]]] = {
+        "arb": [],
+        "news": [],
+        "risk": [],
+    }
+
+    arb_mod = types.ModuleType("engine.combinatorial_arb")
+
+    def fake_evaluate_group(
+        group: MarketGroup | None,
+        books: dict[str, OrderBookSnapshot] | None,
+        target_shares: float,
+        *,
+        fee_buffer: float = 0.0,
+        slippage_buffer: float = 0.0,
+        min_net_edge: float = 0.015,
+        min_executable_shares: float | None = None,
+        now: datetime | None = None,
+    ) -> TradeSignal | None:
+        captured_calls["arb"].append(
+            {
+                "target_shares": target_shares,
+                "fee_buffer": fee_buffer,
+                "slippage_buffer": slippage_buffer,
+                "min_net_edge": min_net_edge,
+                "min_executable_shares": min_executable_shares,
+                "now": now,
+            }
+        )
+        assert now is not None and now.tzinfo is not None
+        assert group is not None and books is not None
+        if "tok-yes" not in books or "tok-no" not in books:
+            return None
+        return _make_signal(
+            signal_id="pr2-arb-1",
+            strategy="COMBINATORIAL_ARB",
+            event_id=group.event_id,
+            legs=[
+                OrderLeg(
+                    token_id="tok-yes",
+                    side="BUY",
+                    target_shares=target_shares,
+                    expected_vwap=0.45,
+                    max_acceptable_price=0.46,
+                ),
+                OrderLeg(
+                    token_id="tok-no",
+                    side="BUY",
+                    target_shares=target_shares,
+                    expected_vwap=0.45,
+                    max_acceptable_price=0.46,
+                ),
+            ],
+            expected_net_edge=0.10,
+            total_cost_usdc=target_shares * 0.90,
+        )
+
+    arb_mod.evaluate_group = fake_evaluate_group  # type: ignore[attr-defined]
+
+    news_mod = types.ModuleType("engine.news_latency")
+
+    def fake_evaluate_news(
+        assessment: NewsAssessment | None,
+        book: OrderBookSnapshot | None,
+        *,
+        now: datetime,
+        event_id: str | None = None,
+        max_age_sec: float = 120.0,
+        fee_buffer: float = 0.0,
+        bankroll_usdc: float = 1000.0,
+        max_position_usdc: float = 50.0,
+    ) -> TradeSignal | None:
+        captured_calls["news"].append(
+            {
+                "now": now,
+                "event_id": event_id,
+                "max_age_sec": max_age_sec,
+                "fee_buffer": fee_buffer,
+                "bankroll_usdc": bankroll_usdc,
+                "max_position_usdc": max_position_usdc,
+            }
+        )
+        assert now.tzinfo is not None
+        assert assessment is not None and book is not None
+        return _make_signal(
+            signal_id=f"pr2-news-{assessment.news_id}",
+            strategy="NEWS_LATENCY",
+            event_id=event_id or assessment.target_token_id,
+            legs=[
+                OrderLeg(
+                    token_id=assessment.target_token_id,
+                    side="BUY",
+                    target_shares=24.0,
+                    expected_vwap=0.50,
+                    max_acceptable_price=0.52,
+                )
+            ],
+            expected_net_edge=0.20,
+            total_cost_usdc=12.0,
+        )
+
+    news_mod.evaluate_news = fake_evaluate_news  # type: ignore[attr-defined]
+
+    risk_mod = types.ModuleType("engine.risk_manager")
+
+    def fake_approve_signal(
+        signal: TradeSignal | None,
+        books: dict[str, OrderBookSnapshot] | None,
+        current_exposure_usdc: float,
+        *,
+        current_event_exposure_usdc: float = 0.0,
+        bankroll_usdc: float = 1000.0,
+        max_event_exposure_usdc: float = 50.0,
+        now: datetime | None = None,
+    ) -> FakeRiskDecision:
+        captured_calls["risk"].append(
+            {
+                "current_exposure_usdc": current_exposure_usdc,
+                "current_event_exposure_usdc": current_event_exposure_usdc,
+                "bankroll_usdc": bankroll_usdc,
+                "max_event_exposure_usdc": max_event_exposure_usdc,
+                "now": now,
+            }
+        )
+        assert signal is not None
+        if current_event_exposure_usdc + signal.total_cost_usdc > max_event_exposure_usdc:
+            return FakeRiskDecision(
+                approved=False,
+                reason=FakeRiskReason.EVENT_EXPOSURE_EXCEEDED,
+                detail=f"evento {signal.event_id}: cap {max_event_exposure_usdc:.2f} superato",
+                required_usdc=signal.total_cost_usdc,
+            )
+        return FakeRiskDecision(
+            approved=True,
+            reason=FakeRiskReason.APPROVED,
+            detail="approvato",
+            required_usdc=signal.total_cost_usdc,
+        )
+
+    risk_mod.approve_signal = fake_approve_signal  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "engine.combinatorial_arb", arb_mod)
+    monkeypatch.setitem(sys.modules, "engine.news_latency", news_mod)
+    monkeypatch.setitem(sys.modules, "engine.risk_manager", risk_mod)
+
+    adapter = DynamicEngineAdapter(
+        target_shares=10.0,
+        min_arb_net_edge=0.02,
+        news_max_age_sec=90.0,
+        bankroll_usdc=500.0,
+        max_position_usdc=25.0,
+    )
+
+    group = MarketGroup(
+        event_id="evt-pr2",
+        title="PR2 Alignment Event",
+        mutually_exclusive=True,
+        outcomes=[
+            MarketOutcome(market_id="m1", question="Q?", outcome_label="Yes", token_id="tok-yes"),
+            MarketOutcome(market_id="m1", question="Q?", outcome_label="No", token_id="tok-no"),
+        ],
+    )
+    log_file = tmp_path / "pr2_alignment.jsonl"
+    runner = PaperTradingRunner(
+        discovery_client=object(),
+        engine=adapter,
+        trade_logger=PaperTradeLogger(log_path=log_file),
+        market_groups=[group],
+        books={"tok-no": _make_book("tok-no", asks=[(0.45, 50.0)])},
+    )
+
+    # 1) Arb fill: 10 shares * (0.45 + 0.45) = 9.0 USDC on evt-pr2
+    arb_fills = await runner.handle_book_update(_make_book("tok-yes", asks=[(0.45, 50.0), (0.50, 50.0)]))
+    assert len(arb_fills) == 1
+    assert arb_fills[0].status == "FILLED"
+    assert arb_fills[0].actual_simulated_cost_usdc == pytest.approx(9.0)
+    assert adapter.current_exposure_usdc == pytest.approx(9.0)
+    assert adapter.event_exposure_usdc["evt-pr2"] == pytest.approx(9.0)
+    assert captured_calls["arb"][0]["target_shares"] == pytest.approx(10.0)
+    assert captured_calls["arb"][0]["min_net_edge"] == pytest.approx(0.02)
+
+    # 2) News fill #1: resolves event_id="evt-pr2", actual cost = 24 * 0.45 = 10.8 -> total 19.8 <= 25.0 cap
+    news_1 = NewsAssessment(
+        news_id="n-1",
+        source="rss",
+        headline="Positive catalyst",
+        published_at=datetime.now(UTC) - timedelta(seconds=2),
+        target_token_id="tok-yes",
+        estimated_fair_prob=0.80,
+        confidence=0.90,
+    )
+    fill_1 = await runner.handle_news_assessment(news_1)
+    assert fill_1 is not None
+    assert fill_1.status == "FILLED"
+    assert fill_1.actual_simulated_cost_usdc == pytest.approx(10.8)
+    assert adapter.current_exposure_usdc == pytest.approx(19.8)
+    assert adapter.event_exposure_usdc["evt-pr2"] == pytest.approx(19.8)
+    assert captured_calls["news"][0]["event_id"] == "evt-pr2"
+    assert captured_calls["risk"][1]["current_exposure_usdc"] == pytest.approx(9.0)
+    assert captured_calls["risk"][1]["current_event_exposure_usdc"] == pytest.approx(9.0)
+
+    # 3) News fill #2: 19.8 + 12.0 > 25.0 max_event_exposure -> rejected by RiskDecision
+    news_2 = NewsAssessment(
+        news_id="n-2",
+        source="rss",
+        headline="Follow-up news",
+        published_at=datetime.now(UTC) - timedelta(seconds=1),
+        target_token_id="tok-yes",
+        estimated_fair_prob=0.85,
+        confidence=0.95,
+    )
+    fill_2 = await runner.handle_news_assessment(news_2)
+    assert fill_2 is None
+    assert adapter.current_exposure_usdc == pytest.approx(19.8)
+
+    entries = [json.loads(line) for line in log_file.read_text(encoding="utf-8").splitlines()]
+    assert [e["event_type"] for e in entries] == [
+        "PAPER_FILL",
+        "PAPER_FILL",
+        "SIGNAL_REJECTED",
+    ]
+    assert entries[2]["payload"]["event_id"] == "evt-pr2"
+    assert entries[2]["payload"]["reason"].startswith("EVENT_EXPOSURE_EXCEEDED: ")

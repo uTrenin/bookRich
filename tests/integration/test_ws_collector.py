@@ -98,6 +98,74 @@ async def test_gamma_discovery_negrisk_binary_and_filtering() -> None:
             ],
         },
         {
+            "id": "evt_complete_negrisk",
+            "title": "Complete NegRisk Race",
+            "active": True,
+            "closed": False,
+            "negRisk": True,
+            "markets": [
+                {
+                    "id": "mkt_c1",
+                    "question": "Candidate 1 wins?",
+                    "groupItemTitle": "C1",
+                    "active": True,
+                    "closed": False,
+                    "liquidityNum": 1000.0,
+                    "outcomes": '["Yes", "No"]',
+                    "clobTokenIds": '["tok_c1_yes", "tok_c1_no"]',
+                },
+                {
+                    "id": "mkt_c2",
+                    "question": "Candidate 2 wins?",
+                    "groupItemTitle": "C2",
+                    "active": True,
+                    "closed": False,
+                    "liquidityNum": 1200.0,
+                    "outcomes": '["Yes", "No"]',
+                    "clobTokenIds": '["tok_c2_yes", "tok_c2_no"]',
+                },
+                {
+                    "id": "mkt_c3",
+                    "question": "Candidate 3 wins?",
+                    "groupItemTitle": "C3",
+                    "active": True,
+                    "closed": False,
+                    "liquidityNum": 900.0,
+                    "outcomes": '["Yes", "No"]',
+                    "clobTokenIds": '["tok_c3_yes", "tok_c3_no"]',
+                },
+            ],
+        },
+        {
+            "id": "evt_non_negrisk_multi",
+            "title": "Non-NegRisk Multi Deadlines",
+            "active": True,
+            "closed": False,
+            "negRisk": False,
+            "markets": [
+                {
+                    "id": "mkt_q1",
+                    "question": "Event happens by Q1?",
+                    "groupItemTitle": "Q1",
+                    "active": True,
+                    "closed": False,
+                    "liquidityNum": 800.0,
+                    "outcomes": '["Yes", "No"]',
+                    "clobTokenIds": '["tok_q1_yes", "tok_q1_no"]',
+                },
+                {
+                    "id": "mkt_q2",
+                    "question": "Event happens by Q2?",
+                    "groupItemTitle": "Q2",
+                    "active": True,
+                    "closed": False,
+                    "liquidityNum": 800.0,
+                    "outcomes": '["Yes", "No"]',
+                    "clobTokenIds": '["tok_q2_yes", "tok_q2_no"]',
+                },
+            ],
+        },
+        {
             "id": "evt_binary",
             "title": "BTC above 100k?",
             "active": True,
@@ -200,17 +268,35 @@ async def test_gamma_discovery_negrisk_binary_and_filtering() -> None:
     assert req.url.params["closed"] == "false"
     assert req.url.params["limit"] == "50"
 
-    assert len(groups) == 2
+    assert len(groups) == 4
 
     election = groups[0]
     assert election.event_id == "evt_election"
-    assert election.mutually_exclusive is True
+    # Partially filtered negRisk event cannot be treated as exhaustive sum-to-one arb.
+    assert election.mutually_exclusive is False
     assert [(o.outcome_label, o.token_id) for o in election.outcomes] == [
         ("Alice", "tok_alice_yes"),
         ("Bob", "tok_bob_yes"),
     ]
 
-    binary = groups[1]
+    complete_negrisk = groups[1]
+    assert complete_negrisk.event_id == "evt_complete_negrisk"
+    assert complete_negrisk.mutually_exclusive is True
+    assert [(o.outcome_label, o.token_id) for o in complete_negrisk.outcomes] == [
+        ("C1", "tok_c1_yes"),
+        ("C2", "tok_c2_yes"),
+        ("C3", "tok_c3_yes"),
+    ]
+
+    non_negrisk_multi = groups[2]
+    assert non_negrisk_multi.event_id == "evt_non_negrisk_multi"
+    assert non_negrisk_multi.mutually_exclusive is False
+    assert [(o.outcome_label, o.token_id) for o in non_negrisk_multi.outcomes] == [
+        ("Q1", "tok_q1_yes"),
+        ("Q2", "tok_q2_yes"),
+    ]
+
+    binary = groups[3]
     assert binary.event_id == "evt_binary"
     assert binary.mutually_exclusive is True
     assert [(o.outcome_label, o.token_id) for o in binary.outcomes] == [

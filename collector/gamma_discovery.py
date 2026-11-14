@@ -148,12 +148,13 @@ class GammaDiscoveryClient:
             is_neg_risk = _parse_bool(event.get("negRisk"), default=False) or _parse_bool(
                 event.get("enableNegRisk"), default=False
             )
-            is_multi_market = len(raw_markets) > 1 or is_neg_risk
+            valid_raw_markets = [market for market in raw_markets if isinstance(market, dict)]
+            if not valid_raw_markets:
+                continue
+            is_multi_market = len(valid_raw_markets) > 1 or is_neg_risk
 
             active_markets: list[dict[str, Any]] = []
-            for market in raw_markets:
-                if not isinstance(market, dict):
-                    continue
+            for market in valid_raw_markets:
                 if not _parse_bool(market.get("active"), default=True):
                     continue
                 if _parse_bool(market.get("closed"), default=False):
@@ -187,7 +188,9 @@ class GammaDiscoveryClient:
                             token_id=yes_token_id,
                         )
                     )
-                mutually_exclusive = bool(is_neg_risk or len(outcomes) > 1)
+                # Sum-to-one arb requires an exhaustive negRisk group with zero filtered sub-markets.
+                is_complete_group = len(outcomes) == len(valid_raw_markets)
+                mutually_exclusive = bool(is_neg_risk and is_complete_group and len(outcomes) > 1)
             else:
                 market = active_markets[0]
                 token_ids = _parse_str_list(market.get("clobTokenIds"))

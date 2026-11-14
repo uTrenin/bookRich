@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import importlib
+import inspect
 import logging
 import os
 import signal as signal_mod
@@ -62,7 +64,49 @@ class EngineProtocol(Protocol):
 class DynamicEngineAdapter:
     """Lazily resolves /engine modules when present, failing safe when absent."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        target_shares: float | None = None,
+        min_arb_net_edge: float | None = None,
+        news_max_age_sec: float | None = None,
+        bankroll_usdc: float | None = None,
+        max_position_usdc: float | None = None,
+        fee_buffer: float = 0.0,
+        slippage_buffer: float = 0.0,
+        min_executable_shares: float | None = None,
+    ) -> None:
+        self.target_shares: float = (
+            float(target_shares)
+            if target_shares is not None
+            else float(os.getenv("ARB_TARGET_SHARES", "25.0") or "25.0")
+        )
+        self.min_arb_net_edge: float = (
+            float(min_arb_net_edge)
+            if min_arb_net_edge is not None
+            else float(os.getenv("MIN_ARB_NET_EDGE", "0.015") or "0.015")
+        )
+        self.news_max_age_sec: float = (
+            float(news_max_age_sec)
+            if news_max_age_sec is not None
+            else float(os.getenv("NEWS_MAX_AGE_SEC", "120.0") or "120.0")
+        )
+        self.bankroll_usdc: float = (
+            float(bankroll_usdc)
+            if bankroll_usdc is not None
+            else float(os.getenv("PAPER_STARTING_BANKROLL_USDC", "1000.0") or "1000.0")
+        )
+        self.max_position_usdc: float = (
+            float(max_position_usdc)
+            if max_position_usdc is not None
+            else float(os.getenv("MAX_POSITION_USDC", "50.0") or "50.0")
+        )
+        self.fee_buffer: float = float(fee_buffer)
+        self.slippage_buffer: float = float(slippage_buffer)
+        self.min_executable_shares: float | None = min_executable_shares
+        self.current_exposure_usdc: float = 0.0
+        self.event_exposure_usdc: dict[str, float] = {}
+
         self._arb_eval: Callable[..., Any] | None = self._load_callable(
             "engine.combinatorial_arb",
             "evaluate_group",
@@ -119,36 +163,161 @@ class DynamicEngineAdapter:
 
         return None
 
+    @staticmethod
+    def _inspect_signature(fn: Callable[..., Any]) -> tuple[list[inspect.Parameter], dict[str, inspect.Parameter], bool, bool]:
+        sig = inspect.signature(fn)
+        pos_params = [
+            param
+            for param in sig.parameters.values()
+            if param.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        ]
+        has_var_pos = any(
+            param.kind == inspect.Parameter.VAR_POSITIONAL for param in sig.parameters.values()
+        )
+        has_var_kw = any(
+            param.kind == inspect.Parameter.VAR_KEYWORD for param in sig.parameters.values()
+        )
+        return pos_params, dict(sig.parameters), has_var_pos, has_var_kw
+
+    @staticmethod
+    def _filter_kwargs(
+        params: dict[str, inspect.Parameter],
+        has_var_kw: bool,
+        candidates: dict[str, Any],
+    ) -> dict[str, Any]:
+        if has_var_kw:
+            return dict(candidates)
+        return {
+            key: value
+            for key, value in candidates.items()
+            if key in params and params[key].kind != inspect.Parameter.POSITIONAL_ONLY
+        }
+
+    def record_fill(self, signal: TradeSignal, fill: PaperFill) -> None:
+        """Track cumulative and per-event virtual exposure for executed paper fills."""
+        if fill.status == "FILLED" and fill.actual_simulated_cost_usdc > 0.0:
+            cost = float(fill.actual_simulated_cost_usdc)
+            self.current_exposure_usdc += cost
+            self.event_exposure_usdc[signal.event_id] = (
+                self.event_exposure_usdc.get(signal.event_id, 0.0) + cost
+            )
+
     def evaluate_group(
-        self, group: MarketGroup, books: dict[str, OrderBookSnapshot]
+        self,
+        group: MarketGroup,
+        books: dict[str, OrderBookSnapshot],
+        *,
+        target_shares: float | None = None,
+        now: datetime | None = None,
     ) -> TradeSignal | None:
         """Delegate group arbitrage evaluation to engine.combinatorial_arb if loaded."""
         if self._arb_eval is None:
             return None
-        return self._arb_eval(group, books)
+
+        shares = self.target_shares if target_shares is None else float(target_shares)
+        eval_now = now if now is not None else datetime.now(timezone.utc)
+        pos_params, params, has_var_pos, has_var_kw = self._inspect_signature(self._arb_eval)
+
+        args: tuple[Any, ...] = (group, books)
+        candidates: dict[str, Any] = {
+            "fee_buffer": self.fee_buffer,
+            "slippage_buffer": self.slippage_buffer,
+            "min_net_edge": self.min_arb_net_edge,
+            "min_executable_shares": self.min_executable_shares,
+            "now": eval_now,
+        }
+        target_param = params.get("target_shares")
+        if target_param is not None:
+            if target_param.kind == inspect.Parameter.KEYWORD_ONLY:
+                candidates["target_shares"] = shares
+            else:
+                args = (group, books, shares)
+        elif len(pos_params) >= 3 or has_var_pos:
+            args = (group, books, shares)
+
+        kwargs = self._filter_kwargs(params, has_var_kw, candidates)
+        return self._arb_eval(*args, **kwargs)
 
     def evaluate_news(
-        self, assessment: NewsAssessment, book: OrderBookSnapshot | None
+        self,
+        assessment: NewsAssessment,
+        book: OrderBookSnapshot | None,
+        *,
+        event_id: str | None = None,
+        now: datetime | None = None,
     ) -> TradeSignal | None:
         """Delegate news-latency evaluation to engine.news_latency if loaded."""
         if self._news_eval is None:
             return None
-        return self._news_eval(assessment, book)
+
+        eval_now = now if now is not None else datetime.now(timezone.utc)
+        _, params, _, has_var_kw = self._inspect_signature(self._news_eval)
+        candidates: dict[str, Any] = {
+            "now": eval_now,
+            "event_id": event_id,
+            "max_age_sec": self.news_max_age_sec,
+            "fee_buffer": self.fee_buffer,
+            "bankroll_usdc": self.bankroll_usdc,
+            "max_position_usdc": self.max_position_usdc,
+        }
+        kwargs = self._filter_kwargs(params, has_var_kw, candidates)
+        return self._news_eval(assessment, book, **kwargs)
 
     def approve_signal(
-        self, signal: TradeSignal, books: dict[str, OrderBookSnapshot]
+        self,
+        signal: TradeSignal,
+        books: dict[str, OrderBookSnapshot],
+        *,
+        current_exposure_usdc: float | None = None,
+        current_event_exposure_usdc: float | None = None,
+        now: datetime | None = None,
     ) -> tuple[bool, str]:
         """Delegate deterministic risk checks to engine.risk_manager if loaded."""
         if self._risk_approve is None:
             return False, "engine_not_loaded"
-        result = self._risk_approve(signal, books)
+
+        total_exp = (
+            self.current_exposure_usdc
+            if current_exposure_usdc is None
+            else float(current_exposure_usdc)
+        )
+        event_exp = (
+            self.event_exposure_usdc.get(signal.event_id, 0.0)
+            if current_event_exposure_usdc is None
+            else float(current_event_exposure_usdc)
+        )
+
+        pos_params, params, has_var_pos, has_var_kw = self._inspect_signature(self._risk_approve)
+        args: tuple[Any, ...] = (signal, books)
+        candidates: dict[str, Any] = {
+            "current_event_exposure_usdc": event_exp,
+            "bankroll_usdc": self.bankroll_usdc,
+            "max_event_exposure_usdc": self.max_position_usdc,
+            "now": now,
+        }
+
+        exp_param = params.get("current_exposure_usdc")
+        if exp_param is not None:
+            if exp_param.kind == inspect.Parameter.KEYWORD_ONLY:
+                candidates["current_exposure_usdc"] = total_exp
+            else:
+                args = (signal, books, total_exp)
+        elif len(pos_params) >= 3 or has_var_pos:
+            args = (signal, books, total_exp)
+
+        kwargs = self._filter_kwargs(params, has_var_kw, candidates)
+        result = self._risk_approve(*args, **kwargs)
         if isinstance(result, tuple) and len(result) >= 2:
             return bool(result[0]), str(result[1])
         if isinstance(result, bool):
             return result, ("approved" if result else "rejected")
         if hasattr(result, "approved"):
-            reason = getattr(result, "reason", "approved" if result.approved else "rejected")
-            return bool(result.approved), str(reason)
+            reason_obj = getattr(result, "reason", "approved" if result.approved else "rejected")
+            reason = str(getattr(reason_obj, "value", reason_obj))
+            detail = str(getattr(result, "detail", "") or "").strip()
+            if detail and detail != reason:
+                return bool(result.approved), f"{reason}: {detail}"
+            return bool(result.approved), reason
         return False, "invalid_risk_response"
 
 
@@ -275,6 +444,8 @@ class PaperTradingRunner:
 
                 self._stats["signals_approved"] += 1
                 fill = self.simulator.simulate_signal(signal, books_view)
+                if fill.status == "FILLED" and hasattr(self.engine, "record_fill"):
+                    self.engine.record_fill(signal, fill)
                 self.trade_logger.log_paper_fill(fill, signal=signal)
                 if fill.status == "FILLED":
                     self._stats["fills_executed"] += 1
@@ -283,6 +454,29 @@ class PaperTradingRunner:
                 fills.append(fill)
 
             return fills
+
+    def _call_evaluate_news(
+        self,
+        assessment: NewsAssessment,
+        book: OrderBookSnapshot | None,
+        *,
+        event_id: str | None,
+    ) -> TradeSignal | None:
+        eval_fn = self.engine.evaluate_news
+        try:
+            sig = inspect.signature(eval_fn)
+        except (TypeError, ValueError):
+            return eval_fn(assessment, book)
+
+        has_var_kw = any(
+            param.kind == inspect.Parameter.VAR_KEYWORD for param in sig.parameters.values()
+        )
+        event_param = sig.parameters.get("event_id")
+        if has_var_kw or (
+            event_param is not None and event_param.kind != inspect.Parameter.POSITIONAL_ONLY
+        ):
+            return eval_fn(assessment, book, event_id=event_id)
+        return eval_fn(assessment, book)
 
     async def handle_news_assessment(self, assessment: NewsAssessment) -> PaperFill | None:
         """Evaluate a classified news event against the current target order book."""
@@ -302,7 +496,9 @@ class PaperTradingRunner:
                     self._books[assessment.target_token_id] = book
 
             books_view = dict(self._books)
-            signal = self.engine.evaluate_news(assessment, book)
+            matched_groups = self._groups_by_token.get(assessment.target_token_id, [])
+            resolved_event_id = matched_groups[0].event_id if matched_groups else None
+            signal = self._call_evaluate_news(assessment, book, event_id=resolved_event_id)
             if signal is None:
                 return None
 
@@ -315,6 +511,8 @@ class PaperTradingRunner:
 
             self._stats["signals_approved"] += 1
             fill = self.simulator.simulate_signal(signal, books_view)
+            if fill.status == "FILLED" and hasattr(self.engine, "record_fill"):
+                self.engine.record_fill(signal, fill)
             self.trade_logger.log_paper_fill(
                 fill,
                 signal=signal,
