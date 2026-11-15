@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import importlib
 import inspect
 import logging
+import math
 import os
 import signal as signal_mod
 import time
@@ -74,8 +75,9 @@ class DynamicEngineAdapter:
         bankroll_usdc: float | None = None,
         max_position_usdc: float | None = None,
         fee_buffer: float = 0.0,
-        slippage_buffer: float = 0.0,
+        slippage_buffer: float | None = None,
         min_executable_shares: float | None = None,
+        fee_rate: float | None = None,
     ) -> None:
         self.target_shares: float = (
             float(target_shares)
@@ -103,7 +105,20 @@ class DynamicEngineAdapter:
             else float(os.getenv("MAX_POSITION_USDC", "50.0") or "50.0")
         )
         self.fee_buffer: float = float(fee_buffer)
-        self.slippage_buffer: float = float(slippage_buffer)
+        self.slippage_buffer: float = (
+            float(slippage_buffer)
+            if slippage_buffer is not None
+            else float(os.getenv("SLIPPAGE_BUFFER", "0.0") or "0.0")
+        )
+        # Taker fee as a fraction of the traded notional; TAKER_FEE_BPS=200 means 2%.
+        self.fee_rate: float = (
+            float(fee_rate)
+            if fee_rate is not None
+            else float(os.getenv("TAKER_FEE_BPS", "0") or "0") / 10_000.0
+        )
+        for name, value in (("fee_rate", self.fee_rate), ("slippage_buffer", self.slippage_buffer)):
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be a finite non-negative number, got {value!r}")
         self.min_executable_shares: float | None = min_executable_shares
         self.current_exposure_usdc: float = 0.0
         self.event_exposure_usdc: dict[str, float] = {}
@@ -236,6 +251,7 @@ class DynamicEngineAdapter:
         args: tuple[Any, ...] = (group, books)
         candidates: dict[str, Any] = {
             "fee_buffer": self.fee_buffer,
+            "fee_rate": self.fee_rate,
             "slippage_buffer": self.slippage_buffer,
             "min_net_edge": self.min_arb_net_edge,
             "min_executable_shares": self.min_executable_shares,
@@ -272,6 +288,7 @@ class DynamicEngineAdapter:
             "event_id": event_id,
             "max_age_sec": self.news_max_age_sec,
             "fee_buffer": self.fee_buffer,
+            "fee_rate": self.fee_rate,
             "bankroll_usdc": self.bankroll_usdc,
             "max_position_usdc": self.max_position_usdc,
         }
@@ -308,6 +325,7 @@ class DynamicEngineAdapter:
             "current_event_exposure_usdc": event_exp,
             "bankroll_usdc": self.bankroll_usdc,
             "max_event_exposure_usdc": self.max_position_usdc,
+            "fee_rate": self.fee_rate,
             "now": now,
         }
 
@@ -371,7 +389,13 @@ class PaperTradingRunner:
         self.engine: EngineProtocol = (
             engine if engine is not None else DynamicEngineAdapter()
         )
-        self.simulator = simulator if simulator is not None else PaperOrderSimulator()
+        # Engine and simulator must price fees identically, so the default simulator
+        # takes its rate from the engine adapter.
+        self.simulator = (
+            simulator
+            if simulator is not None
+            else PaperOrderSimulator(fee_rate=float(getattr(self.engine, "fee_rate", 0.0) or 0.0))
+        )
         self.trade_logger = (
             trade_logger if trade_logger is not None else PaperTradeLogger(log_path=log_path)
         )
@@ -427,6 +451,9 @@ class PaperTradingRunner:
             "tracked_groups": len(self._market_groups),
             "tracked_books": len(self._books),
         }
+        fee_rate = getattr(self.simulator, "fee_rate", None)
+        if isinstance(fee_rate, (int, float)) and not isinstance(fee_rate, bool):
+            stats["taker_fee_bps"] = round(float(fee_rate) * 10_000.0, 6)
         feed_lag = getattr(self.book_stream, "feed_lag_sec", None)
         if isinstance(feed_lag, (int, float)):
             stats["feed_lag_sec"] = float(feed_lag)
@@ -434,6 +461,15 @@ class PaperTradingRunner:
         if isinstance(ignored, int) and not isinstance(ignored, bool):
             stats["ws_deltas_ignored"] = ignored
         return stats
+
+    def _fees_paid(self, fill: PaperFill) -> float | None:
+        """Taker fees inside a fill's simulated cost (None when the simulator has no rate)."""
+        fee_rate = getattr(self.simulator, "fee_rate", None)
+        if not isinstance(fee_rate, (int, float)) or isinstance(fee_rate, bool):
+            return None
+        if fill.status != "FILLED" or fee_rate <= 0.0:
+            return 0.0
+        return fill.actual_simulated_cost_usdc * fee_rate / (1.0 + fee_rate)
 
     def _log_rejection(self, signal: TradeSignal, reason: str) -> None:
         """Log a risk rejection, throttling identical ones (same strategy, event, reason code)."""
@@ -488,7 +524,7 @@ class PaperTradingRunner:
                 fill = self.simulator.simulate_signal(signal, books_view)
                 if fill.status == "FILLED" and hasattr(self.engine, "record_fill"):
                     self.engine.record_fill(signal, fill)
-                self.trade_logger.log_paper_fill(fill, signal=signal)
+                self.trade_logger.log_paper_fill(fill, signal=signal, fees_usdc=self._fees_paid(fill))
                 if fill.status == "FILLED":
                     self._stats["fills_executed"] += 1
                 else:
@@ -558,6 +594,7 @@ class PaperTradingRunner:
                 fill,
                 signal=signal,
                 news_published_at=assessment.published_at,
+                fees_usdc=self._fees_paid(fill),
             )
             if fill.status == "FILLED":
                 self._stats["fills_executed"] += 1

@@ -64,6 +64,7 @@ def evaluate_group(
     min_net_edge: float = DEFAULT_MIN_NET_EDGE,
     min_executable_shares: float | None = None,
     now: datetime | None = None,
+    fee_rate: float = 0.0,
 ) -> TradeSignal | None:
     """Valuta un gruppo mutuamente esclusivo e restituisce un segnale bilanciato o `None`.
 
@@ -79,6 +80,11 @@ def evaluate_group(
             Con `None` il segnale richiede l'intera `target_shares` su ogni leg.
         now: istante della valutazione; se `None` si usa il timestamp piu recente
             tra i book coinvolti (resta deterministico).
+        fee_rate: commissione taker come frazione del controvalore speso
+            (es. 0.02 = 2%). Si somma a `fee_buffer`, che resta un importo fisso per set.
+
+    `total_cost_usdc` del segnale resta il costo di book, senza commissioni:
+    le commissioni entrano in `expected_net_edge`.
 
     Returns:
         `TradeSignal(strategy="COMBINATORIAL_ARB")` con un leg BUY per esito, tutti
@@ -89,6 +95,8 @@ def evaluate_group(
     if not is_finite_number(target_shares) or target_shares <= 0.0:
         return None
     if not (_non_negative(fee_buffer) and _non_negative(slippage_buffer) and _non_negative(min_net_edge)):
+        return None
+    if not _non_negative(fee_rate):
         return None
     if min_executable_shares is not None and (
         not is_finite_number(min_executable_shares) or min_executable_shares <= 0.0
@@ -126,9 +134,11 @@ def evaluate_group(
             return None
         fills.append(fill)
 
-    cost_per_set = sum(fill.vwap for fill in fills)
+    book_cost_per_set = sum(fill.vwap for fill in fills)
+    # La commissione taker e proporzionale a quanto si spende: gonfia il costo del set.
+    cost_per_set = book_cost_per_set * (1.0 + fee_rate)
     threshold = 1.0 - fee_buffer - slippage_buffer - min_net_edge
-    # Disuguaglianza stretta: somma ask == soglia NON e un'opportunita.
+    # Disuguaglianza stretta: costo == soglia NON e un'opportunita.
     if threshold - cost_per_set <= EPS:
         return None
 
@@ -139,7 +149,8 @@ def evaluate_group(
     net_edge = 1.0 - cost_per_set - fee_buffer - slippage_buffer
     total_cost = sum(fill.notional_usdc for fill in fills)
     rationale = (
-        f"Sum-to-one su {len(fills)} esiti: costo VWAP per set {cost_per_set:.6f} "
+        f"Sum-to-one su {len(fills)} esiti: costo VWAP per set {book_cost_per_set:.6f}, "
+        f"{cost_per_set:.6f} con commissione {fee_rate:.4%}, "
         f"< soglia {threshold:.6f} (fee {fee_buffer:.4f}, slippage {slippage_buffer:.4f}, "
         f"min edge {min_net_edge:.4f}); {shares:.6f} shares per leg, "
         f"edge netto {net_edge:.6f} per 1$ di payoff."

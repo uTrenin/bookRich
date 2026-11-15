@@ -83,6 +83,7 @@ def evaluate_news(
     max_position_usdc: float = DEFAULT_MAX_POSITION_USDC,
     min_position_usdc: float = DEFAULT_MIN_POSITION_USDC,
     max_future_skew_sec: float = DEFAULT_MAX_FUTURE_SKEW_SEC,
+    fee_rate: float = 0.0,
 ) -> TradeSignal | None:
     """Valuta una notizia contro il book e restituisce un segnale BUY o `None`.
 
@@ -100,6 +101,12 @@ def evaluate_news(
         max_position_usdc: cap assoluto alla spesa del singolo segnale.
         min_position_usdc: sotto questa spesa il segnale non viene emesso.
         max_future_skew_sec: tolleranza per notizie "dal futuro" (clock skew).
+        fee_rate: commissione taker come frazione del controvalore speso
+            (es. 0.02 = 2%). Il prezzo effettivo per share diventa
+            `prezzo * (1 + fee_rate) + fee_buffer`.
+
+    `max_position_usdc` limita la spesa commissioni incluse; `total_cost_usdc`
+    del segnale resta il costo di book, senza commissioni.
     """
     if assessment is None or book is None:
         return None
@@ -112,7 +119,7 @@ def evaluate_news(
         return None
     numeric_params = (
         max_age_sec, min_net_edge, min_confidence, fee_buffer, kelly_fraction,
-        bankroll_usdc, max_position_usdc, min_position_usdc, max_future_skew_sec,
+        bankroll_usdc, max_position_usdc, min_position_usdc, max_future_skew_sec, fee_rate,
     )
     if any(not is_finite_number(param) or param < 0.0 for param in numeric_params):
         return None
@@ -138,36 +145,44 @@ def evaluate_news(
     if best_ask is None:
         return None
 
+    fee_multiplier = 1.0 + fee_rate
+
+    def effective_price(book_price: float) -> float:
+        """Costo reale di una share: prezzo di book piu commissione proporzionale e fissa."""
+        return book_price * fee_multiplier + fee_buffer
+
     # 4. Edge sul top of book: se manca qui, manca ovunque piu in profondita.
-    limit_price = fair - fee_buffer - min_net_edge
+    # Prezzo di book massimo a cui, pagate le commissioni, resta ancora l'edge minimo.
+    limit_price = (fair - fee_buffer - min_net_edge) / fee_multiplier
     if best_ask > limit_price + EPS:
         return None
 
-    # 5. Sizing: Kelly frazionario x confidenza, cappato.
+    # 5. Sizing: Kelly frazionario x confidenza, cappato. Il budget include le commissioni.
     scale = bankroll_usdc * kelly_fraction * confidence
-    budget = min(scale * kelly_fraction_for_binary(fair, best_ask + fee_buffer), max_position_usdc)
+    budget = min(scale * kelly_fraction_for_binary(fair, effective_price(best_ask)), max_position_usdc)
     if budget <= 0.0 or budget + EPS < min_position_usdc:
         return None
-    fill = fill_for_budget(book, budget, limit_price=limit_price)
+    fill = fill_for_budget(book, budget / fee_multiplier, limit_price=limit_price)
     if fill.vwap is None:
         return None
     # Il VWAP reale e >= best ask: si ricalcola il Kelly sul prezzo effettivo e si
     # riduce il budget se serve, cosi la spesa non supera mai il Kelly frazionario.
-    refined_budget = min(budget, scale * kelly_fraction_for_binary(fair, fill.vwap + fee_buffer))
+    refined_budget = min(budget, scale * kelly_fraction_for_binary(fair, effective_price(fill.vwap)))
     if refined_budget + EPS < budget:
-        fill = fill_for_budget(book, refined_budget, limit_price=limit_price)
+        fill = fill_for_budget(book, refined_budget / fee_multiplier, limit_price=limit_price)
     if fill.vwap is None or fill.worst_price is None or fill.filled_shares <= 0.0:
         return None
     if fill.notional_usdc + EPS < min_position_usdc:
         return None
 
-    net_edge = fair - fill.vwap - fee_buffer
+    net_edge = fair - effective_price(fill.vwap)
     if net_edge <= 0.0 or net_edge + EPS < min_net_edge:
         return None
 
     rationale = (
         f"News '{assessment.news_id}' ({assessment.source}) eta {age_sec:.1f}s <= {max_age_sec:.0f}s: "
-        f"fair {fair:.4f} vs VWAP ask {fill.vwap:.6f} (fee {fee_buffer:.4f}) -> edge netto {net_edge:.6f}; "
+        f"fair {fair:.4f} vs VWAP ask {fill.vwap:.6f} (commissione {fee_rate:.4%}, fee {fee_buffer:.4f}) "
+        f"-> edge netto {net_edge:.6f}; "
         f"confidenza {confidence:.2f}, Kelly x{kelly_fraction:.2f}, "
         f"{fill.filled_shares:.6f} shares per {fill.notional_usdc:.4f} USDC "
         f"(cap {max_position_usdc:.2f})."
