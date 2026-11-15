@@ -1,0 +1,203 @@
+{
+  "_comment": "Sessione costruita a mano nel formato dei messaggi pubblici di Polymarket (Gamma /events, CLOB /book, canale WS market, feed RSS). NON e' una cattura dal vivo: da rete italiana l'API e' bloccata. I campi timestamp e le date delle notizie vengono riscritti al momento del replay.",
+
+  "gamma_events": [
+    {
+      "id": "50101",
+      "slug": "ecb-rate-cut-december",
+      "title": "ECB rate decision in December",
+      "active": true,
+      "closed": false,
+      "archived": false,
+      "negRisk": false,
+      "markets": [
+        {
+          "id": "610101",
+          "conditionId": "0xaaa1",
+          "question": "Will the ECB cut rates in December?",
+          "active": true,
+          "closed": false,
+          "liquidityNum": 84210.5,
+          "outcomes": "[\"Yes\", \"No\"]",
+          "clobTokenIds": "[\"100000000101\", \"100000000102\"]"
+        }
+      ]
+    },
+    {
+      "id": "50202",
+      "slug": "film-of-the-year-2026",
+      "title": "Film of the Year 2026 winner",
+      "active": true,
+      "closed": false,
+      "archived": false,
+      "negRisk": true,
+      "markets": [
+        {
+          "id": "620201",
+          "conditionId": "0xbbb1",
+          "question": "Will Alpha win Film of the Year 2026?",
+          "groupItemTitle": "Alpha",
+          "active": true,
+          "closed": false,
+          "liquidityNum": 30111.0,
+          "outcomes": "[\"Yes\", \"No\"]",
+          "clobTokenIds": "[\"200000000201\", \"200000000291\"]"
+        },
+        {
+          "id": "620202",
+          "conditionId": "0xbbb2",
+          "question": "Will Beta win Film of the Year 2026?",
+          "groupItemTitle": "Beta",
+          "active": true,
+          "closed": false,
+          "liquidityNum": 22870.0,
+          "outcomes": "[\"Yes\", \"No\"]",
+          "clobTokenIds": "[\"200000000202\", \"200000000292\"]"
+        },
+        {
+          "id": "620203",
+          "conditionId": "0xbbb3",
+          "question": "Will Gamma win Film of the Year 2026?",
+          "groupItemTitle": "Gamma",
+          "active": true,
+          "closed": false,
+          "liquidityNum": 18004.0,
+          "outcomes": "[\"Yes\", \"No\"]",
+          "clobTokenIds": "[\"200000000203\", \"200000000293\"]"
+        }
+      ]
+    },
+    {
+      "id": "50303",
+      "slug": "btc-above-by-year-end",
+      "title": "Bitcoin above threshold by year end",
+      "active": true,
+      "closed": false,
+      "archived": false,
+      "negRisk": false,
+      "markets": [
+        {
+          "id": "630301",
+          "conditionId": "0xccc1",
+          "question": "Will Bitcoin be above $100k on December 31?",
+          "groupItemTitle": ">100k",
+          "active": true,
+          "closed": false,
+          "liquidityNum": 51000.0,
+          "outcomes": "[\"Yes\", \"No\"]",
+          "clobTokenIds": "[\"300000000301\", \"300000000391\"]"
+        },
+        {
+          "id": "630302",
+          "conditionId": "0xccc2",
+          "question": "Will Bitcoin be above $110k on December 31?",
+          "groupItemTitle": ">110k",
+          "active": true,
+          "closed": false,
+          "liquidityNum": 47000.0,
+          "outcomes": "[\"Yes\", \"No\"]",
+          "clobTokenIds": "[\"300000000302\", \"300000000392\"]"
+        },
+        {
+          "id": "630303",
+          "conditionId": "0xccc3",
+          "question": "Will Bitcoin be above $120k on December 31?",
+          "groupItemTitle": ">120k",
+          "active": true,
+          "closed": false,
+          "liquidityNum": 39000.0,
+          "outcomes": "[\"Yes\", \"No\"]",
+          "clobTokenIds": "[\"300000000303\", \"300000000393\"]"
+        }
+      ]
+    },
+    {
+      "id": "50404",
+      "slug": "fed-rate-cut-december",
+      "title": "Fed rate decision in December",
+      "active": true,
+      "closed": false,
+      "archived": false,
+      "negRisk": false,
+      "markets": [
+        {
+          "id": "640401",
+          "conditionId": "0xddd1",
+          "question": "Will the Fed cut rates in December?",
+          "active": true,
+          "closed": false,
+          "liquidityNum": 120340.0,
+          "outcomes": "[\"Yes\", \"No\"]",
+          "clobTokenIds": "[\"400000000401\", \"400000000402\"]"
+        }
+      ]
+    }
+  ],
+
+  "rest_books": {
+    "100000000101": {"bids": [{"price": "0.50", "size": "150"}], "asks": [{"price": "0.52", "size": "200"}]},
+    "100000000102": {"bids": [{"price": "0.47", "size": "100"}], "asks": [{"price": "0.50", "size": "200"}]},
+    "200000000201": {"bids": [{"price": "0.38", "size": "200"}], "asks": [{"price": "0.40", "size": "300"}]},
+    "200000000202": {"bids": [{"price": "0.33", "size": "200"}], "asks": [{"price": "0.35", "size": "300"}]},
+    "200000000203": {"bids": [{"price": "0.26", "size": "200"}], "asks": [{"price": "0.28", "size": "300"}]},
+    "300000000301": {"bids": [{"price": "0.28", "size": "100"}], "asks": [{"price": "0.30", "size": "100"}]},
+    "300000000302": {"bids": [{"price": "0.13", "size": "100"}], "asks": [{"price": "0.15", "size": "100"}]},
+    "300000000303": {"bids": [{"price": "0.03", "size": "100"}], "asks": [{"price": "0.05", "size": "100"}]},
+    "400000000401": {"bids": [{"price": "0.53", "size": "300"}], "asks": [{"price": "0.55", "size": "500"}]},
+    "400000000402": {"bids": [{"price": "0.44", "size": "300"}], "asks": [{"price": "0.47", "size": "400"}]}
+  },
+
+  "ws_connections": [
+    [
+      [
+        {"event_type": "book", "asset_id": "100000000101", "market": "0xaaa1", "timestamp": "0", "bids": [{"price": "0.50", "size": "150"}], "asks": [{"price": "0.52", "size": "200"}]},
+        {"event_type": "book", "asset_id": "100000000102", "market": "0xaaa1", "timestamp": "0", "bids": [{"price": "0.47", "size": "100"}], "asks": [{"price": "0.50", "size": "200"}]},
+        {"event_type": "book", "asset_id": "200000000201", "market": "0xbbb1", "timestamp": "0", "bids": [{"price": "0.38", "size": "200"}], "asks": [{"price": "0.40", "size": "300"}]},
+        {"event_type": "book", "asset_id": "200000000202", "market": "0xbbb2", "timestamp": "0", "bids": [{"price": "0.33", "size": "200"}], "asks": [{"price": "0.35", "size": "300"}]},
+        {"event_type": "book", "asset_id": "200000000203", "market": "0xbbb3", "timestamp": "0", "bids": [{"price": "0.26", "size": "200"}], "asks": [{"price": "0.28", "size": "300"}]},
+        {"event_type": "book", "asset_id": "300000000301", "market": "0xccc1", "timestamp": "0", "bids": [{"price": "0.28", "size": "100"}], "asks": [{"price": "0.30", "size": "100"}]},
+        {"event_type": "book", "asset_id": "300000000302", "market": "0xccc2", "timestamp": "0", "bids": [{"price": "0.13", "size": "100"}], "asks": [{"price": "0.15", "size": "100"}]},
+        {"event_type": "book", "asset_id": "300000000303", "market": "0xccc3", "timestamp": "0", "bids": [{"price": "0.03", "size": "100"}], "asks": [{"price": "0.05", "size": "100"}]},
+        {"event_type": "book", "asset_id": "400000000401", "market": "0xddd1", "timestamp": "0", "bids": [{"price": "0.53", "size": "300"}], "asks": [{"price": "0.55", "size": "500"}]},
+        {"event_type": "book", "asset_id": "400000000402", "market": "0xddd1", "timestamp": "0", "bids": [{"price": "0.44", "size": "300"}], "asks": [{"price": "0.47", "size": "400"}]}
+      ],
+      "PONG",
+      {"_step": "ECB: compare un ask YES a 0.47 -> YES+NO costa 0.97 per set", "event_type": "price_change", "asset_id": "100000000101", "market": "0xaaa1", "timestamp": "0", "changes": [{"price": "0.47", "side": "SELL", "size": "80"}]},
+      {"_step": "ECB: cambia solo un bid NO, l'arbitraggio e' ancora li'", "event_type": "price_change", "market": "0xaaa1", "timestamp": "0", "price_changes": [{"asset_id": "100000000102", "price": "0.48", "side": "BUY", "size": "60", "best_bid": "0.48", "best_ask": "0.50"}]},
+      {"_step": "ECB: l'ask a 0.47 scende a 30 shares, l'occasione c'e' ancora ma il tetto di esposizione no", "event_type": "price_change", "asset_id": "100000000101", "market": "0xaaa1", "timestamp": "0", "changes": [{"price": "0.47", "side": "SELL", "size": "30"}]},
+      {"_step": "ECB: l'ask a 0.47 sparisce, torna 1.02", "event_type": "price_change", "asset_id": "100000000101", "market": "0xaaa1", "timestamp": "0", "changes": [{"price": "0.47", "side": "SELL", "size": "0"}]},
+      {"_step": "Film: Gamma a 0.20 ma solo 10 shares -> in cima al book 0.95, su 25 shares 0.998: NON e' arbitraggio", "event_type": "price_change", "asset_id": "200000000203", "market": "0xbbb3", "timestamp": "0", "changes": [{"price": "0.20", "side": "SELL", "size": "10"}]},
+      {"_step": "Film: Gamma a 0.20 con 120 shares -> 0.95 per set anche in profondita'", "event_type": "price_change", "asset_id": "200000000203", "market": "0xbbb3", "timestamp": "0", "changes": [{"price": "0.20", "side": "SELL", "size": "120"}]},
+      {"_step": "BTC: soglie annidate, somma degli ask 0.49 ma gli esiti non si escludono", "event_type": "price_change", "asset_id": "300000000303", "market": "0xccc3", "timestamp": "0", "changes": [{"price": "0.04", "side": "SELL", "size": "50"}]},
+      {"_control": "drop"}
+    ],
+    [
+      {"_step": "Dopo la riconnessione arriva un delta PRIMA dello snapshot: ask YES a 0.30, va ignorato", "event_type": "price_change", "asset_id": "100000000101", "market": "0xaaa1", "timestamp": "0", "changes": [{"price": "0.30", "side": "SELL", "size": "500"}]},
+      [
+        {"event_type": "book", "asset_id": "100000000101", "market": "0xaaa1", "timestamp": "0", "bids": [{"price": "0.51", "size": "150"}], "asks": [{"price": "0.53", "size": "200"}]},
+        {"event_type": "book", "asset_id": "100000000102", "market": "0xaaa1", "timestamp": "0", "bids": [{"price": "0.48", "size": "60"}], "asks": [{"price": "0.50", "size": "200"}]},
+        {"event_type": "book", "asset_id": "200000000201", "market": "0xbbb1", "timestamp": "0", "bids": [{"price": "0.38", "size": "200"}], "asks": [{"price": "0.40", "size": "300"}]},
+        {"event_type": "book", "asset_id": "200000000202", "market": "0xbbb2", "timestamp": "0", "bids": [{"price": "0.33", "size": "200"}], "asks": [{"price": "0.35", "size": "300"}]},
+        {"event_type": "book", "asset_id": "200000000203", "market": "0xbbb3", "timestamp": "0", "bids": [{"price": "0.27", "size": "200"}], "asks": [{"price": "0.29", "size": "300"}]},
+        {"event_type": "book", "asset_id": "300000000301", "market": "0xccc1", "timestamp": "0", "bids": [{"price": "0.28", "size": "100"}], "asks": [{"price": "0.30", "size": "100"}]},
+        {"event_type": "book", "asset_id": "300000000302", "market": "0xccc2", "timestamp": "0", "bids": [{"price": "0.13", "size": "100"}], "asks": [{"price": "0.15", "size": "100"}]},
+        {"event_type": "book", "asset_id": "300000000303", "market": "0xccc3", "timestamp": "0", "bids": [{"price": "0.03", "size": "100"}], "asks": [{"price": "0.05", "size": "100"}]},
+        {"event_type": "book", "asset_id": "400000000401", "market": "0xddd1", "timestamp": "0", "bids": [{"price": "0.53", "size": "300"}], "asks": [{"price": "0.55", "size": "500"}]},
+        {"event_type": "book", "asset_id": "400000000402", "market": "0xddd1", "timestamp": "0", "bids": [{"price": "0.44", "size": "300"}], "asks": [{"price": "0.47", "size": "400"}]}
+      ],
+      {"_control": "release_news"},
+      "PONG"
+    ]
+  ],
+
+  "rss_items": [
+    {"guid": "wire-0001", "title": "Fed cuts rates by 25 bps, Powell says", "description": "The Federal Reserve lowered its benchmark rate by a quarter point.", "age_sec": 5},
+    {"guid": "wire-0002", "title": "Analysis: what last week's ECB minutes mean", "description": "A look back at the European Central Bank minutes.", "age_sec": 900},
+    {"guid": "wire-0003", "title": "Rumor: Fed officials said to weigh options", "description": "Unconfirmed report from a single unnamed source.", "age_sec": 8}
+  ],
+
+  "llm_responses": {
+    "Fed cuts rates by 25 bps, Powell says": {"target_token_id": "400000000401", "estimated_fair_prob": 0.80, "confidence": 0.90},
+    "Rumor: Fed officials said to weigh options": {"target_token_id": "400000000401", "estimated_fair_prob": 0.70, "confidence": 0.40}
+  }
+}
