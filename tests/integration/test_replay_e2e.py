@@ -130,7 +130,9 @@ def _rss_payload(items: list[dict[str, Any]]) -> str:
     return f'<?xml version="1.0"?><rss version="2.0"><channel>{entries}</channel></rss>'
 
 
-async def run_replay_session(log_path: Path, timeout_sec: float = 10.0) -> ReplayResult:
+async def run_replay_session(
+    log_path: Path, timeout_sec: float = 10.0, taker_fee_bps: float = 0.0
+) -> ReplayResult:
     """Replay the recorded session through the real bot and return what it produced."""
     session = json.loads(SESSION_PATH.read_text(encoding="utf-8"))
     news_released = asyncio.Event()
@@ -185,6 +187,8 @@ async def run_replay_session(log_path: Path, timeout_sec: float = 10.0) -> Repla
             news_max_age_sec=120.0,
             bankroll_usdc=1000.0,
             max_position_usdc=50.0,
+            slippage_buffer=0.0,
+            fee_rate=taker_fee_bps / 10_000.0,
         )
         runner = PaperTradingRunner(
             discovery_client=discovery,
@@ -286,3 +290,36 @@ async def test_replay_session_end_to_end(tmp_path: Path) -> None:
     assert result.exposure_by_event == pytest.approx({"50101": 48.5, "50202": 23.75, "50404": 50.0})
     assert result.total_exposure_usdc == pytest.approx(122.25)
     assert result.log_entries[-1]["event_type"] == "HEARTBEAT_STATS"
+
+
+@pytest.mark.asyncio
+async def test_replay_session_with_a_two_percent_taker_fee(tmp_path: Path) -> None:
+    """Same session, 2% taker fee: thin opportunities disappear, the rest cost more."""
+    result = await run_replay_session(tmp_path / "replay_fee.jsonl", taker_fee_bps=200.0)
+
+    trades = [e for e in result.log_entries if e["event_type"] != "HEARTBEAT_STATS"]
+    assert [(e["event_type"], e["payload"]["strategy"], e["payload"]["event_id"]) for e in trades] == [
+        ("PAPER_FILL", "COMBINATORIAL_ARB", "50202"),
+        ("PAPER_FILL", "NEWS_LATENCY", "50404"),
+    ]
+    film, fed = (e["payload"] for e in trades)
+
+    # ECB: 0.97 per set becomes 0.9894 with the fee, above the 0.985 threshold -> never traded.
+    assert "50101" not in result.exposure_by_event
+
+    # Film: 0.95 per set becomes 0.969 -> still an arbitrage, with a thinner edge.
+    assert film["expected_net_edge"] == pytest.approx(1.0 - 0.95 * 1.02)
+    assert film["signal_total_cost_usdc"] == pytest.approx(23.75)
+    assert film["fees_usdc"] == pytest.approx(23.75 * 0.02)
+    assert film["actual_simulated_cost_usdc"] == pytest.approx(23.75 * 1.02)
+
+    # Fed news: the 50 USDC cap now includes the fee, so fewer shares are bought.
+    assert fed["actual_simulated_cost_usdc"] == pytest.approx(50.0)
+    assert fed["fees_usdc"] == pytest.approx(50.0 * 0.02 / 1.02)
+    assert fed["filled_legs"][0]["target_shares"] == pytest.approx(50.0 / 1.02 / 0.55)
+    assert fed["expected_net_edge"] == pytest.approx(0.80 - 0.55 * 1.02)
+
+    assert result.stats["taker_fee_bps"] == pytest.approx(200.0)
+    assert result.stats["signals_generated"] == 2
+    assert result.stats["signals_rejected_risk"] == 0
+    assert result.exposure_by_event == pytest.approx({"50202": 23.75 * 1.02, "50404": 50.0})
