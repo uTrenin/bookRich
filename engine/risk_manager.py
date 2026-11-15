@@ -76,6 +76,7 @@ def approve_signal(
     max_total_exposure_usdc: float | None = None,
     now: datetime | None = None,
     max_book_age_sec: float | None = None,
+    fee_rate: float = 0.0,
 ) -> RiskDecision:
     """Approva o blocca un segnale. Non solleva mai eccezioni.
 
@@ -96,9 +97,11 @@ def approve_signal(
         max_event_exposure_usdc: cap di esposizione per singolo evento.
         max_total_exposure_usdc: cap opzionale di esposizione totale.
         now, max_book_age_sec: controllo opzionale di freschezza sui timestamp.
+        fee_rate: commissione taker come frazione del controvalore speso.
 
     Il capitale richiesto e il massimo tra `signal.total_cost_usdc` e il costo
-    dei leg BUY ricalcolato sul book corrente (stima conservativa).
+    dei leg BUY ricalcolato sul book corrente (stima conservativa), aumentato
+    della commissione: e quanto uscirebbe davvero dal bankroll.
     """
     if signal is None or books is None:
         return _reject(RiskReason.INVALID_INPUT, "segnale o mappa dei book mancante")
@@ -106,6 +109,8 @@ def approve_signal(
     limits = (current_exposure_usdc, current_event_exposure_usdc, bankroll_usdc, max_event_exposure_usdc)
     if any(not is_finite_number(value) or value < 0.0 for value in limits):
         return _reject(RiskReason.INVALID_INPUT, "esposizione o limiti non numerici, NaN o negativi")
+    if not is_finite_number(fee_rate) or fee_rate < 0.0:
+        return _reject(RiskReason.INVALID_INPUT, "fee_rate non valido")
     if max_total_exposure_usdc is not None and (
         not is_finite_number(max_total_exposure_usdc) or max_total_exposure_usdc < 0.0
     ):
@@ -161,7 +166,7 @@ def approve_signal(
         if leg.side == "BUY":
             recomputed_buy_cost += fill.notional_usdc
 
-    required = max(float(signal_cost), recomputed_buy_cost)
+    required = max(float(signal_cost), recomputed_buy_cost) * (1.0 + fee_rate)
 
     # 3. Limiti di capitale.
     if current_event_exposure_usdc + required > max_event_exposure_usdc + EPS:
