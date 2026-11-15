@@ -82,6 +82,9 @@ class ClobOrderBookStream:
         max_backoff_sec: float = 60.0,
         on_book_update: Callable[[OrderBookSnapshot], Awaitable[None] | None] | None = None,
         http_client: httpx.AsyncClient | None = None,
+        max_feed_lag_sec: float | None = None,
+        rest_concurrency: int = 8,
+        resync_grace_sec: float = 5.0,
     ) -> None:
         self.token_ids = list(dict.fromkeys(str(tid).strip() for tid in token_ids if str(tid).strip()))
         self.rest_url = rest_url.rstrip("/")
@@ -92,6 +95,18 @@ class ClobOrderBookStream:
         self.on_book_update = on_book_update
         self._http_client = http_client
         self._books: dict[str, OrderBookSnapshot] = {}
+        # Feed lag beyond this marks every book stale (defaults to the staleness threshold).
+        self.max_feed_lag_sec = (
+            float(max_feed_lag_sec) if max_feed_lag_sec is not None else self.stale_threshold_sec
+        )
+        self.rest_concurrency = max(1, int(rest_concurrency))
+        self.resync_grace_sec = float(resync_grace_sec)
+        # Local receive time of the latest WS frame (PONG included): proof the connection is alive.
+        self._last_message_at: datetime | None = None
+        # Lag between exchange event time and local processing time, from price_change events.
+        self._feed_lag_sec: float | None = None
+        self._feed_lag_measured_at: datetime | None = None
+        self._ignored_deltas = 0
 
     async def fetch_initial_snapshot(self, token_id: str) -> OrderBookSnapshot:
         """Fetch an initial L2 snapshot via GET /book?token_id=<token_id>."""
@@ -128,17 +143,70 @@ class ClobOrderBookStream:
         if not self.token_ids:
             return {}
 
-        if self._http_client is not None:
-            await asyncio.gather(*(self.fetch_initial_snapshot(tid) for tid in self.token_ids))
-        else:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                self._http_client = client
-                try:
-                    await asyncio.gather(*(self.fetch_initial_snapshot(tid) for tid in self.token_ids))
-                finally:
-                    self._http_client = None
-
+        await self._fetch_snapshots(self.token_ids)
         return self.get_all_books()
+
+    async def _fetch_snapshots(self, token_ids: list[str]) -> list[str]:
+        """Fetch REST snapshots with bounded concurrency; return the token_ids that failed.
+
+        A failing token (HTTP 429/404, timeout) never aborts the others: its book stays
+        missing or stale until a WS `book` event or a later resync provides a snapshot.
+        """
+        if not token_ids:
+            return []
+        semaphore = asyncio.Semaphore(self.rest_concurrency)
+
+        async def _fetch_one(token_id: str) -> str | None:
+            async with semaphore:
+                try:
+                    await self.fetch_initial_snapshot(token_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning("REST snapshot failed for token_id=%s: %r", token_id, exc)
+                    return token_id
+            return None
+
+        async def _fetch_all() -> list[str]:
+            results = await asyncio.gather(*(_fetch_one(tid) for tid in token_ids))
+            return [tid for tid in results if tid is not None]
+
+        if self._http_client is not None:
+            return await _fetch_all()
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            self._http_client = client
+            try:
+                return await _fetch_all()
+            finally:
+                self._http_client = None
+
+    def _tokens_needing_snapshot(self) -> list[str]:
+        """Token ids whose book is missing or explicitly marked stale."""
+        return [
+            tid
+            for tid in self.token_ids
+            if tid not in self._books or self._books[tid].is_stale
+        ]
+
+    async def _resync_after_grace(self, stop_event: asyncio.Event | None) -> None:
+        """Fallback resync: REST-refetch books the WS did not snapshot shortly after subscribing."""
+        if self.resync_grace_sec > 0.0:
+            waiter = stop_event if stop_event is not None else asyncio.Event()
+            try:
+                await asyncio.wait_for(waiter.wait(), timeout=self.resync_grace_sec)
+                return  # stop requested
+            except asyncio.TimeoutError:
+                pass
+        pending = self._tokens_needing_snapshot()
+        if not pending:
+            return
+        failed = await self._fetch_snapshots(pending)
+        logger.info(
+            "REST resync after (re)subscribe: %d token(s) refreshed, %d failed",
+            len(pending) - len(failed),
+            len(failed),
+        )
 
     def apply_ws_message(
         self,
@@ -147,6 +215,8 @@ class ClobOrderBookStream:
     ) -> list[OrderBookSnapshot]:
         """Apply a CLOB WebSocket message (book snapshot or price_change delta) to local books."""
         ts = _ensure_utc(now) if now is not None else datetime.now(timezone.utc)
+        # Any frame (PONG included) proves the connection is alive at `ts`.
+        self._last_message_at = ts
 
         parsed: Any = message
         if isinstance(parsed, bytes):
@@ -209,6 +279,8 @@ class ClobOrderBookStream:
         if not raw_changes:
             return {}
 
+        self._record_feed_lag(event.get("timestamp"), ts)
+
         changes_by_token: dict[str, list[tuple[str, float, float]]] = {}
         for change in raw_changes:
             token_id = str(change.get("asset_id") or change.get("token_id") or top_token).strip()
@@ -226,8 +298,16 @@ class ClobOrderBookStream:
         updated: dict[str, OrderBookSnapshot] = {}
         for token_id, deltas in changes_by_token.items():
             existing = self._books.get(token_id)
-            bid_map = {lvl.price: lvl.size for lvl in existing.bids} if existing is not None else {}
-            ask_map = {lvl.price: lvl.size for lvl in existing.asks} if existing is not None else {}
+            if existing is None or existing.is_stale:
+                # A delta is only meaningful on top of a known-good snapshot. Applying it to a
+                # missing book would create a one-level book, and applying it to a stale book
+                # would mark fresh a book that missed updates while disconnected. Wait for a
+                # `book` event (sent on subscribe) or the REST resync instead.
+                self._ignored_deltas += 1
+                logger.debug("Ignoring price_change for token_id=%s without a fresh snapshot", token_id)
+                continue
+            bid_map = {lvl.price: lvl.size for lvl in existing.bids}
+            ask_map = {lvl.price: lvl.size for lvl in existing.asks}
 
             for side, price, size in deltas:
                 target_map = bid_map if side in {"BUY", "BID"} else ask_map
@@ -264,10 +344,61 @@ class ClobOrderBookStream:
             return None
 
         ref_now = _ensure_utc(now) if now is not None else datetime.now(timezone.utc)
-        elapsed_sec = (ref_now - _ensure_utc(snapshot.updated_at)).total_seconds()
-        if snapshot.is_stale or elapsed_sec > self.stale_threshold_sec:
+        if snapshot.is_stale or self._is_time_stale(snapshot, ref_now):
             return snapshot.model_copy(update={"is_stale": True})
         return snapshot.model_copy()
+
+    def _is_time_stale(self, snapshot: OrderBookSnapshot, ref_now: datetime) -> bool:
+        """Staleness from connection liveness and feed lag, not from per-token inactivity.
+
+        A quiet market on a live connection has an unchanged, valid book: the reference is
+        the latest of the book's own update and the last frame received (PONG included).
+        """
+        last_alive = _ensure_utc(snapshot.updated_at)
+        if self._last_message_at is not None and self._last_message_at > last_alive:
+            last_alive = self._last_message_at
+        if (ref_now - last_alive).total_seconds() > self.stale_threshold_sec:
+            return True
+        return self._is_feed_lagging(ref_now)
+
+    def _is_feed_lagging(self, ref_now: datetime) -> bool:
+        """True while recently processed events were generated too long before we handled them."""
+        if self._feed_lag_sec is None or self._feed_lag_measured_at is None:
+            return False
+        if self._feed_lag_sec <= self.max_feed_lag_sec:
+            return False
+        # A measurement only describes a backlog while events keep flowing: let it expire.
+        return (ref_now - self._feed_lag_measured_at).total_seconds() <= self.stale_threshold_sec
+
+    def _record_feed_lag(self, raw_timestamp: Any, ts: datetime) -> None:
+        """Track local-vs-exchange lag from an event `timestamp` (epoch milliseconds)."""
+        exchange_ms = _safe_float(raw_timestamp)
+        if exchange_ms is None or exchange_ms <= 0.0:
+            return
+        try:
+            exchange_ts = datetime.fromtimestamp(exchange_ms / 1000.0, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return
+        was_lagging = self._feed_lag_sec is not None and self._feed_lag_sec > self.max_feed_lag_sec
+        self._feed_lag_sec = (ts - exchange_ts).total_seconds()
+        self._feed_lag_measured_at = ts
+        if self._feed_lag_sec > self.max_feed_lag_sec and not was_lagging:
+            logger.warning(
+                "CLOB feed lag %.1fs exceeds %.1fs: books treated as stale "
+                "(processing backlog or local clock ahead of the exchange)",
+                self._feed_lag_sec,
+                self.max_feed_lag_sec,
+            )
+
+    @property
+    def feed_lag_sec(self) -> float | None:
+        """Latest measured lag between exchange event time and local processing time."""
+        return self._feed_lag_sec
+
+    @property
+    def ignored_delta_count(self) -> int:
+        """Number of price_change deltas skipped because no fresh snapshot was available."""
+        return self._ignored_deltas
 
     def get_all_books(self, now: datetime | None = None) -> dict[str, OrderBookSnapshot]:
         """Return all stored book snapshots evaluated for staleness at `now`."""
@@ -420,6 +551,7 @@ class ClobOrderBookStream:
             return
 
         if self.token_ids:
+            # Per-token failures are logged, never raised: the reconnect loop must always start.
             await self.initialize_books()
 
         connector = ws_connect or websockets.connect
@@ -432,6 +564,7 @@ class ClobOrderBookStream:
                     await self._ws_send(ws, sub_payload)
 
                     ping_task = asyncio.create_task(self._ping_loop(ws, stop_event=stop_event))
+                    resync_task = asyncio.create_task(self._resync_after_grace(stop_event))
                     try:
                         async for raw_msg in self._iter_messages(ws, stop_event=stop_event, ping_task=ping_task):
                             backoff = 1.0
@@ -441,9 +574,10 @@ class ClobOrderBookStream:
                             if stop_event is not None and stop_event.is_set():
                                 break
                     finally:
-                        ping_task.cancel()
-                        with contextlib.suppress(asyncio.CancelledError, Exception):
-                            await ping_task
+                        for task in (ping_task, resync_task):
+                            task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError, Exception):
+                                await task
 
                 if stop_event is not None and stop_event.is_set():
                     break

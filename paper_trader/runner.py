@@ -9,6 +9,7 @@ import inspect
 import logging
 import os
 import signal as signal_mod
+import time
 from pathlib import Path
 from typing import Any, Callable, Protocol, runtime_checkable
 
@@ -122,6 +123,19 @@ class DynamicEngineAdapter:
             "approve_signal",
             ("RiskManager", "DeterministicRiskManager"),
         )
+        # An engine that fails to import must be loud: otherwise the bot runs for days
+        # producing no signals and no error.
+        self.missing_components: list[str] = [
+            name
+            for name, fn in (
+                ("engine.combinatorial_arb.evaluate_group", self._arb_eval),
+                ("engine.news_latency.evaluate_news", self._news_eval),
+                ("engine.risk_manager.approve_signal", self._risk_approve),
+            )
+            if fn is None
+        ]
+        if self.missing_components:
+            logger.error("Quant engine not usable, missing: %s", ", ".join(self.missing_components))
 
     @staticmethod
     def _load_callable(
@@ -131,7 +145,8 @@ class DynamicEngineAdapter:
     ) -> Callable[..., Any] | None:
         try:
             mod = importlib.import_module(module_name)
-        except (ImportError, ModuleNotFoundError):
+        except ImportError as exc:  # ModuleNotFoundError included
+            logger.error("Engine module %s could not be imported: %r", module_name, exc)
             return None
 
         fn = getattr(mod, method_name, None)
@@ -338,6 +353,7 @@ class PaperTradingRunner:
         min_liquidity_usdc: float = 0.0,
         news_feed_urls: list[str] | None = None,
         log_path: str | Path = "logs/paper_trades.jsonl",
+        rejection_log_interval_sec: float = 60.0,
     ) -> None:
         validate_paper_only_safety()
 
@@ -373,7 +389,12 @@ class PaperTradingRunner:
             "signals_rejected_risk": 0,
             "fills_executed": 0,
             "fills_rejected": 0,
+            "rejections_not_logged": 0,
         }
+        # Once an event hits its exposure cap, every later book update re-triggers the same
+        # rejection: log it at most once per interval and count the rest.
+        self.rejection_log_interval_sec = float(rejection_log_interval_sec)
+        self._rejection_log_state: dict[tuple[str, str, str], tuple[float, int]] = {}
 
         if market_groups:
             self.set_market_groups(market_groups)
@@ -400,12 +421,34 @@ class PaperTradingRunner:
 
     def get_heartbeat_stats(self) -> dict[str, Any]:
         """Return a snapshot of runtime paper-trading counters."""
-        return {
+        stats: dict[str, Any] = {
             **self._stats,
             "paper_only": PAPER_ONLY,
             "tracked_groups": len(self._market_groups),
             "tracked_books": len(self._books),
         }
+        feed_lag = getattr(self.book_stream, "feed_lag_sec", None)
+        if isinstance(feed_lag, (int, float)):
+            stats["feed_lag_sec"] = float(feed_lag)
+        ignored = getattr(self.book_stream, "ignored_delta_count", None)
+        if isinstance(ignored, int) and not isinstance(ignored, bool):
+            stats["ws_deltas_ignored"] = ignored
+        return stats
+
+    def _log_rejection(self, signal: TradeSignal, reason: str) -> None:
+        """Log a risk rejection, throttling identical ones (same strategy, event, reason code)."""
+        self._stats["signals_rejected_risk"] += 1
+        key = (signal.strategy, signal.event_id, reason.split(":", 1)[0].strip())
+        now_mono = time.monotonic()
+        last_logged, suppressed = self._rejection_log_state.get(key, (float("-inf"), 0))
+        if now_mono - last_logged < self.rejection_log_interval_sec:
+            self._rejection_log_state[key] = (last_logged, suppressed + 1)
+            self._stats["rejections_not_logged"] += 1
+            return
+        self._rejection_log_state[key] = (now_mono, 0)
+        if suppressed:
+            reason = f"{reason} (+{suppressed} identical rejections not logged)"
+        self.trade_logger.log_signal_rejected(signal, reason)
 
     def _sync_books_from_stream(self) -> None:
         if self.book_stream is not None and hasattr(self.book_stream, "get_all_books"):
@@ -438,8 +481,7 @@ class PaperTradingRunner:
                 self._stats["signals_generated"] += 1
                 approved, reason = self.engine.approve_signal(signal, books_view)
                 if not approved:
-                    self._stats["signals_rejected_risk"] += 1
-                    self.trade_logger.log_signal_rejected(signal, reason)
+                    self._log_rejection(signal, reason)
                     continue
 
                 self._stats["signals_approved"] += 1
@@ -505,8 +547,7 @@ class PaperTradingRunner:
             self._stats["signals_generated"] += 1
             approved, reason = self.engine.approve_signal(signal, books_view)
             if not approved:
-                self._stats["signals_rejected_risk"] += 1
-                self.trade_logger.log_signal_rejected(signal, reason)
+                self._log_rejection(signal, reason)
                 return None
 
             self._stats["signals_approved"] += 1
@@ -541,6 +582,13 @@ class PaperTradingRunner:
     ) -> None:
         """Discover active markets, stream books and news, and log paper executions."""
         validate_paper_only_safety()
+        missing = getattr(self.engine, "missing_components", None)
+        if missing:
+            raise RuntimeError(
+                "Quant engine not usable (missing: "
+                + ", ".join(missing)
+                + "): refusing to start a run that cannot produce any signal."
+            )
         stop = stop_event if stop_event is not None else asyncio.Event()
 
         groups = await self.discovery_client.discover_market_groups(limit=discovery_limit)
@@ -589,6 +637,8 @@ class PaperTradingRunner:
                 )
             )
 
+        fatal: list[tuple[str, BaseException | None]] = []
+
         def _on_task_done(task: asyncio.Task[Any]) -> None:
             if task.cancelled():
                 return
@@ -600,6 +650,12 @@ class PaperTradingRunner:
                     exc,
                     exc_info=exc,
                 )
+            if not stop.is_set():
+                # Every background task is meant to live until stop: one that ends earlier
+                # (crash or silent return) would leave the runner alive with no data.
+                logger.error("Background task %s ended before stop; aborting run", task.get_name())
+                fatal.append((task.get_name(), exc))
+                stop.set()
 
         for task in tasks:
             task.add_done_callback(_on_task_done)
@@ -613,6 +669,12 @@ class PaperTradingRunner:
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             self.trade_logger.log_heartbeat(self.get_heartbeat_stats())
+
+        if fatal:
+            name, cause = fatal[0]
+            raise RuntimeError(
+                f"Background task {name} stopped unexpectedly; run aborted so a supervisor can restart it"
+            ) from cause
 
 
 def _parse_feed_urls_from_env() -> list[str]:
