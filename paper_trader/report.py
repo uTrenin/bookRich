@@ -203,6 +203,19 @@ def format_report(report: dict[str, Any]) -> str:
         f"  Slippage vs Best Ask ({slip['samples']}): avg={slip['avg']:.4f}, p50={slip['p50']:.4f}, p95={slip['p95']:.4f}, max={slip['max']:.4f}",
         f"  News Latency ms ({lat['samples']}): avg={lat['avg']:.1f}ms, p50={lat['p50']:.1f}ms, p95={lat['p95']:.1f}ms, max={lat['max']:.1f}ms",
     ]
+    pnl = (report.get("latest_heartbeat") or {}).get("pnl")
+    if isinstance(pnl, dict):
+        lines.append(
+            "  Virtual P&L (latest heartbeat): "
+            f"equity={pnl.get('equity_usdc', 0.0):.2f} USDC | realized={pnl.get('realized_pnl_usdc', 0.0):+.2f} "
+            f"| unrealized at bid={pnl.get('unrealized_pnl_usdc', 0.0):+.2f} "
+            f"| locked arbitrage={pnl.get('locked_arb_pnl_usdc', 0.0):+.2f}"
+        )
+        lines.append(
+            f"  Open lots: {pnl.get('open_lots', 0)} (cost {pnl.get('cost_basis_usdc', 0.0):.2f} USDC, "
+            f"fees {pnl.get('fees_paid_usdc', 0.0):.2f}) | Max drawdown: {pnl.get('max_drawdown_usdc', 0.0):.2f} USDC "
+            f"({pnl.get('max_drawdown_pct', 0.0):.2f}%)"
+        )
     return "\n".join(lines)
 
 
