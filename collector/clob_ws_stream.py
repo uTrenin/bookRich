@@ -552,10 +552,15 @@ class ClobOrderBookStream:
                     with contextlib.suppress(asyncio.CancelledError, Exception):
                         await next_task
 
-            if stop_event is not None and stop_event.is_set():
-                return
-
-            if reconnect_task is not None and reconnect_task in done:
+            leaving = (stop_event is not None and stop_event.is_set()) or (
+                reconnect_task is not None and reconnect_task in done
+            )
+            if leaving:
+                # The socket is being closed on purpose, so a read that was in flight may
+                # have failed with it. Retrieve that error: an unretrieved task exception
+                # is logged by asyncio as "Task exception was never retrieved".
+                if next_task.done() and not next_task.cancelled():
+                    next_task.exception()
                 return
 
             if not done and timeout is not None:
