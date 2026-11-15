@@ -82,14 +82,23 @@ class PaperOrderSimulator:
                     note=f"Invalid top-of-book price={best_price} for token_id={leg.token_id}",
                 )
 
-            filled_shares, leg_cost = self._walk_levels(levels, leg.target_shares)
+            # A limit order never trades through its limit: only levels priced within
+            # max_acceptable_price are executable, whatever the resulting average would be.
+            filled_shares, leg_cost = self._walk_levels(
+                levels,
+                leg.target_shares,
+                side=leg.side,
+                limit_price=leg.max_acceptable_price,
+                price_tolerance=self.price_tolerance,
+            )
             if filled_shares + self.fill_tolerance < leg.target_shares:
                 return self._rejected_fill(
                     signal=signal,
                     executed_at=exec_ts,
                     status="PARTIAL_REJECTED",
                     note=(
-                        f"Insufficient L2 depth for token_id={leg.token_id}: "
+                        f"Insufficient L2 depth within max_acceptable_price "
+                        f"{leg.max_acceptable_price:.6f} for token_id={leg.token_id}: "
                         f"filled={filled_shares:.6f} < target={leg.target_shares:.6f}"
                     ),
                 )
@@ -158,11 +167,22 @@ class PaperOrderSimulator:
         return sorted(book.bids, key=lambda lvl: lvl.price, reverse=True)
 
     @staticmethod
-    def _walk_levels(levels: list[BookLevel], target_shares: float) -> tuple[float, float]:
-        """Accumulate share quantity and notional USDC cost across ordered L2 levels."""
+    def _walk_levels(
+        levels: list[BookLevel],
+        target_shares: float,
+        side: str = "BUY",
+        limit_price: float | None = None,
+        price_tolerance: float = 0.0,
+    ) -> tuple[float, float]:
+        """Accumulate share quantity and notional USDC cost across ordered L2 levels.
+
+        With `limit_price`, levels priced beyond the limit (above it for BUY, below it for
+        SELL) are not executable and are skipped.
+        """
         remaining = target_shares
         filled_shares = 0.0
         total_cost = 0.0
+        has_limit = limit_price is not None and math.isfinite(limit_price)
 
         for level in levels:
             if remaining <= 0.0:
@@ -174,6 +194,14 @@ class PaperOrderSimulator:
                 or level.size <= 0.0
             ):
                 continue
+            if has_limit:
+                beyond_limit = (
+                    level.price > limit_price + price_tolerance
+                    if side == "BUY"
+                    else level.price < limit_price - price_tolerance
+                )
+                if beyond_limit:
+                    continue
             fill_qty = min(remaining, level.size)
             filled_shares += fill_qty
             total_cost += fill_qty * level.price

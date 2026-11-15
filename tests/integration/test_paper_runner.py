@@ -175,7 +175,7 @@ def test_simulator_buy_multi_level_vwap_and_slippage() -> None:
                 side="BUY",
                 target_shares=30.0,
                 expected_vwap=0.44,
-                max_acceptable_price=0.45,
+                max_acceptable_price=0.50,  # limit price: must cover the worst level walked
             )
         ]
     )
@@ -207,7 +207,7 @@ def test_simulator_multi_leg_weighted_slippage() -> None:
                 side="BUY",
                 target_shares=20.0,
                 expected_vwap=0.43,
-                max_acceptable_price=0.45,
+                max_acceptable_price=0.46,  # limit price: must cover the worst level walked
             ),
             OrderLeg(
                 token_id="tok-no",
@@ -247,7 +247,7 @@ def test_simulator_sell_bid_walk_handles_unsorted_bids() -> None:
                 side="SELL",
                 target_shares=20.0,
                 expected_vwap=0.58,
-                max_acceptable_price=0.57,
+                max_acceptable_price=0.56,  # limit price: must cover the worst level walked
             )
         ],
     )
@@ -514,8 +514,16 @@ def test_logger_append_jsonl_and_daily_summary(tmp_path: Path) -> None:
 def test_dynamic_engine_adapter_fallback_and_delegation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Force the "engine not merged yet" state regardless of whether /engine exists on disk.
+    for module_name in ("engine.combinatorial_arb", "engine.news_latency", "engine.risk_manager"):
+        monkeypatch.setitem(sys.modules, module_name, None)
     adapter = DynamicEngineAdapter()
     assert isinstance(adapter, EngineProtocol)
+    assert adapter.missing_components == [
+        "engine.combinatorial_arb.evaluate_group",
+        "engine.news_latency.evaluate_news",
+        "engine.risk_manager.approve_signal",
+    ]
 
     group = MarketGroup(
         event_id="evt-1",

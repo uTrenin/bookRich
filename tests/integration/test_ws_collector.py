@@ -513,14 +513,26 @@ async def test_clob_rest_snapshot_and_ws_delta_updates() -> None:
     assert expired is not None and expired.is_stale is True
     assert stream.get_book("missing_token") is None
 
-    # Check boundary (30.0s exact = fresh) and strictly past threshold (35.0s > 30.0s = stale)
+    # Staleness follows connection liveness: the last frame arrived at t1, so tok_2 (last
+    # changed at t0+5s) is still a valid, unchanged book until the connection goes quiet.
     all_at_t1_plus_20 = stream.get_all_books(now=t1 + timedelta(seconds=20))
     assert all_at_t1_plus_20["tok_1"].is_stale is False
     assert all_at_t1_plus_20["tok_2"].is_stale is False
 
     all_at_t1_plus_25 = stream.get_all_books(now=t1 + timedelta(seconds=25))
     assert all_at_t1_plus_25["tok_1"].is_stale is False
-    assert all_at_t1_plus_25["tok_2"].is_stale is True
+    assert all_at_t1_plus_25["tok_2"].is_stale is False
+
+    # No frame for more than 30s (not even a PONG): every book is stale.
+    all_silent = stream.get_all_books(now=t1 + timedelta(seconds=30.1))
+    assert all_silent["tok_1"].is_stale is True
+    assert all_silent["tok_2"].is_stale is True
+
+    # A PONG alone keeps the books of a live connection fresh.
+    stream.apply_ws_message("PONG", now=t1 + timedelta(seconds=28))
+    kept_alive = stream.get_all_books(now=t1 + timedelta(seconds=50))
+    assert kept_alive["tok_1"].is_stale is False
+    assert kept_alive["tok_2"].is_stale is False
 
     stream.mark_all_stale()
     assert stream.get_book("tok_1", now=t1) is not None

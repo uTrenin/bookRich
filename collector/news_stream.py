@@ -13,6 +13,7 @@ import json
 import logging
 import math
 import os
+import re
 from typing import Any
 from urllib.parse import urlparse
 import xml.etree.ElementTree as ET
@@ -26,6 +27,23 @@ logger = logging.getLogger(__name__)
 
 PLACEHOLDER_GEMINI_API_KEY = "your_gemini_api_key_here"
 _EPOCH_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_WORD_RE = re.compile(r"[a-z0-9]+")
+_STOPWORDS = frozenset(
+    {
+        "the", "and", "for", "with", "will", "that", "this", "from", "are", "was", "has",
+        "have", "not", "but", "its", "after", "before", "over", "into", "than", "who",
+        "what", "when", "which", "yes", "new", "says", "said",
+    }
+)
+
+
+def _keywords(text: str) -> set[str]:
+    """Lowercase alphanumeric tokens of 3+ characters, minus common stopwords."""
+    return {
+        word
+        for word in _WORD_RE.findall(text.lower())
+        if len(word) >= 3 and word not in _STOPWORDS
+    }
 
 
 class RawNewsItem(BaseModel):
@@ -144,6 +162,7 @@ class GeminiNewsClassifier:
         model_name: str = "gemini-2.5-flash",
         timeout_sec: float = 2.8,
         client: Any | None = None,
+        max_prompt_candidates: int = 40,
     ) -> None:
         raw_key = api_key if api_key is not None else os.getenv("GEMINI_API_KEY")
         cleaned_key = raw_key.strip() if isinstance(raw_key, str) else ""
@@ -155,6 +174,30 @@ class GeminiNewsClassifier:
         self.model_name = model_name
         self.timeout_sec = float(timeout_sec)
         self._client = client
+        self.max_prompt_candidates = max(1, int(max_prompt_candidates))
+
+    def _select_candidates(
+        self,
+        item: RawNewsItem,
+        candidates: list[tuple[MarketGroup, MarketOutcome]],
+    ) -> list[tuple[MarketGroup, MarketOutcome]]:
+        """Bound the prompt size: with many candidates keep only the best keyword matches.
+
+        Sending every outcome of every tracked event makes the prompt grow with the market
+        universe and pushes the call past `timeout_sec`. Small candidate sets are sent whole.
+        """
+        if len(candidates) <= self.max_prompt_candidates:
+            return candidates
+
+        news_words = _keywords(f"{item.headline} {item.summary}")
+        scored: list[tuple[int, int]] = []
+        for index, (group, outcome) in enumerate(candidates):
+            candidate_words = _keywords(f"{group.title} {outcome.question} {outcome.outcome_label}")
+            overlap = len(news_words & candidate_words)
+            if overlap > 0:
+                scored.append((overlap, index))
+        scored.sort(key=lambda pair: (-pair[0], pair[1]))
+        return [candidates[index] for _, index in scored[: self.max_prompt_candidates]]
 
     @property
     def client(self) -> Any | None:
@@ -235,6 +278,12 @@ class GeminiNewsClassifier:
         if not candidates:
             return None
 
+        candidates = self._select_candidates(item, candidates)
+        if not candidates:
+            logger.debug("No candidate outcome matches news_id=%s; skipping LLM call", item.news_id)
+            return None
+        valid_token_ids = {outcome.token_id for _, outcome in candidates}
+
         client = self._get_client()
         if client is None:
             return None
@@ -313,6 +362,7 @@ class NewsStreamCollector:
         on_assessment: Callable[[NewsAssessment], Awaitable[None] | None] | None = None,
         http_client: httpx.AsyncClient | None = None,
         max_seen_ids: int = 10_000,
+        max_concurrent_classifications: int = 4,
     ) -> None:
         self.feed_urls: list[str] = list(feed_urls) if feed_urls is not None else []
         self.classifier: Any = classifier if classifier is not None else GeminiNewsClassifier()
@@ -321,6 +371,7 @@ class NewsStreamCollector:
         self.on_assessment = on_assessment
         self.http_client = http_client
         self._max_seen_ids = max(1, int(max_seen_ids))
+        self.max_concurrent_classifications = max(1, int(max_concurrent_classifications))
         self._seen_ids: set[str] = set()
         self._seen_order: deque[str] = deque()
 
@@ -439,9 +490,14 @@ class NewsStreamCollector:
             return None
 
         if self.on_assessment is not None:
-            callback_result = self.on_assessment(assessment)
-            if inspect.isawaitable(callback_result):
-                await callback_result
+            try:
+                callback_result = self.on_assessment(assessment)
+                if inspect.isawaitable(callback_result):
+                    await callback_result
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("on_assessment callback raised an error for news_id=%s", item.news_id)
 
         return assessment
 
@@ -451,19 +507,30 @@ class NewsStreamCollector:
         now: datetime | None = None,
     ) -> list[NewsAssessment]:
         """Poll all configured feed URLs once and return produced NewsAssessment entries."""
-        assessments: list[NewsAssessment] = []
-        for url in self.feed_urls:
+
+        async def _fetch(url: str) -> list[RawNewsItem]:
             try:
-                items = await self.fetch_feed(url)
+                return await self.fetch_feed(url)
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 logger.warning("Failed fetching news feed url=%s", url, exc_info=True)
-                continue
+                return []
 
-            for item in items:
-                assessment = await self.process_news_item(item, market_groups, now=now)
-                if assessment is not None:
-                    assessments.append(assessment)
-        return assessments
+        # One slow or failing feed must not delay the others.
+        feeds = await asyncio.gather(*(_fetch(url) for url in self.feed_urls))
+        items = [item for feed_items in feeds for item in feed_items]
+
+        # Classify concurrently (bounded): a burst of fresh items must not queue behind
+        # each other's LLM round trip. Each callback fires as soon as its item is classified.
+        semaphore = asyncio.Semaphore(self.max_concurrent_classifications)
+
+        async def _process(item: RawNewsItem) -> NewsAssessment | None:
+            async with semaphore:
+                return await self.process_news_item(item, market_groups, now=now)
+
+        results = await asyncio.gather(*(_process(item) for item in items))
+        return [assessment for assessment in results if assessment is not None]
 
     async def run(
         self,
