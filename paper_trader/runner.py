@@ -6,7 +6,9 @@ import asyncio
 from datetime import datetime, timezone
 import importlib
 import inspect
+import json
 import logging
+import math
 import os
 import signal as signal_mod
 import time
@@ -131,6 +133,14 @@ class DynamicEngineAdapter:
             if slippage_buffer is not None
             else float(os.getenv("SLIPPAGE_BUFFER", "0.0") or "0.0")
         )
+        for param_name, param_val in (
+            ("fee_buffer", self.fee_buffer),
+            ("slippage_buffer", self.slippage_buffer),
+        ):
+            if not math.isfinite(param_val) or param_val < 0.0:
+                raise ValueError(
+                    f"{param_name} must be a finite non-negative number, got {param_val!r}"
+                )
         self.min_executable_shares: float | None = (
             float(min_executable_shares)
             if min_executable_shares is not None
@@ -141,6 +151,12 @@ class DynamicEngineAdapter:
             if max_book_age_sec is not None
             else _optional_float_env("MAX_BOOK_AGE_SEC")
         )
+        if self.max_book_age_sec is not None and (
+            not math.isfinite(self.max_book_age_sec) or self.max_book_age_sec <= 0.0
+        ):
+            raise ValueError(
+                f"max_book_age_sec must be finite and > 0, got {self.max_book_age_sec!r}"
+            )
         self.current_exposure_usdc: float = 0.0
         self.event_exposure_usdc: dict[str, float] = {}
 
@@ -408,6 +424,7 @@ class PaperTradingRunner:
         clob_ws_url: str | None = None,
         ws_receive_timeout_sec: float | None = None,
         daily_summary_enabled: bool = True,
+        write_summary_on_shutdown: bool = False,
         market_refresh_interval_sec: float = 0.0,
     ) -> None:
         validate_paper_only_safety()
@@ -429,6 +446,7 @@ class PaperTradingRunner:
         self._clob_ws_url = clob_ws_url
         self._ws_receive_timeout_sec = ws_receive_timeout_sec
         self.daily_summary_enabled = bool(daily_summary_enabled)
+        self.write_summary_on_shutdown = bool(write_summary_on_shutdown)
         self.market_refresh_interval_sec = float(market_refresh_interval_sec)
         self._last_summary_utc_date = datetime.now(timezone.utc).date().isoformat()
         self.engine: EngineProtocol = (
@@ -630,6 +648,56 @@ class PaperTradingRunner:
                 self._stats["fills_rejected"] += 1
             return fill
 
+    def _backfill_missing_daily_summaries(self, now: datetime | None = None) -> list[dict[str, Any]]:
+        """Generate missing DAILY_SUMMARY entries for past UTC dates already in the JSONL log."""
+        if not self.daily_summary_enabled:
+            return []
+        log_path = getattr(self.trade_logger, "log_path", None)
+        if not isinstance(log_path, Path) or not log_path.exists():
+            return []
+
+        today_utc = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).date().isoformat()
+        dates_with_events: set[str] = set()
+        dates_with_summary: set[str] = set()
+
+        for line in log_path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                entry = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            event_type = entry.get("event_type")
+            payload = entry.get("payload")
+            if event_type == "DAILY_SUMMARY" and isinstance(payload, dict):
+                summary_date = str(payload.get("date") or "").strip()
+                if summary_date:
+                    dates_with_summary.add(summary_date)
+                continue
+            ts_raw = entry.get("ts")
+            if isinstance(ts_raw, str):
+                try:
+                    parsed = datetime.fromisoformat(ts_raw)
+                except ValueError:
+                    continue
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                entry_date = parsed.astimezone(timezone.utc).date().isoformat()
+                if entry_date < today_utc:
+                    dates_with_events.add(entry_date)
+
+        emitted: list[dict[str, Any]] = []
+        for missing_date in sorted(dates_with_events - dates_with_summary):
+            summary = self.trade_logger.generate_daily_summary(
+                date_str=missing_date, write_to_log=True
+            )
+            self._stats["daily_summaries_emitted"] += 1
+            emitted.append(summary)
+        return emitted
+
     def _maybe_emit_daily_summary(self, now: datetime | None = None) -> dict[str, Any] | None:
         """Emit DAILY_SUMMARY for the previous UTC date whenever the UTC day rolls over."""
         if not self.daily_summary_enabled:
@@ -644,39 +712,69 @@ class PaperTradingRunner:
         return summary
 
     async def refresh_markets_once(self, discovery_limit: int = 50) -> tuple[list[str], list[str]]:
-        """Refresh active MarketGroup subscriptions and settle exposure for closed events."""
+        """Refresh active MarketGroup subscriptions, pinning exposed events unless Gamma closes them."""
         new_groups = await self.discovery_client.discover_market_groups(limit=discovery_limit)
         if not new_groups:
             if self._market_groups:
                 logger.warning("Gamma discovery refresh returned 0 groups; keeping existing subscriptions.")
             return [], []
 
-        active_event_ids = {group.event_id for group in new_groups}
+        new_event_ids = {group.event_id for group in new_groups}
+        tracked_exposures = getattr(self.engine, "event_exposure_usdc", None)
+        candidate_missing_ids: list[str] = []
+        if isinstance(tracked_exposures, dict):
+            candidate_missing_ids = [
+                eid
+                for eid, amount in list(tracked_exposures.items())
+                if eid not in new_event_ids and float(amount) > 0.0
+            ]
+
+        closed_lookup: dict[str, bool] = {}
+        is_closed_fn = getattr(self.discovery_client, "is_event_closed", None)
+        if callable(is_closed_fn) and candidate_missing_ids:
+            for eid in candidate_missing_ids:
+                try:
+                    closed = await is_closed_fn(eid)
+                except Exception:
+                    closed = None
+                if closed is True:
+                    closed_lookup[eid] = True
+
         settled_events: list[str] = []
-
         async with self._eval_lock:
-            tracked_exposures = getattr(self.engine, "event_exposure_usdc", None)
-            if isinstance(tracked_exposures, dict) and hasattr(self.engine, "release_event_exposure"):
-                closed_ids = [
-                    eid
-                    for eid, amount in list(tracked_exposures.items())
-                    if eid not in active_event_ids and float(amount) > 0.0
-                ]
-                for eid in closed_ids:
-                    released = float(self.engine.release_event_exposure(eid))
-                    if released > 0.0:
-                        self._stats["events_settled"] += 1
-                        settled_events.append(eid)
-                        self.trade_logger.log_event(
-                            "PAPER_SETTLED",
-                            {
-                                "event_id": eid,
-                                "released_exposure_usdc": released,
-                                "reason": "event_no_longer_active",
-                            },
-                        )
+            existing_by_event = {group.event_id: group for group in self._market_groups}
+            merged_groups = list(new_groups)
+            merged_ids = {group.event_id for group in merged_groups}
 
-            token_ids = self.set_market_groups(new_groups)
+            tracked_exposures = getattr(self.engine, "event_exposure_usdc", None)
+            if isinstance(tracked_exposures, dict):
+                for eid, amount in list(tracked_exposures.items()):
+                    if float(amount) <= 0.0 or eid in merged_ids:
+                        continue
+                    if closed_lookup.get(eid) is True and hasattr(
+                        self.engine, "release_event_exposure"
+                    ):
+                        released = float(self.engine.release_event_exposure(eid))
+                        if released > 0.0:
+                            self._stats["events_settled"] += 1
+                            settled_events.append(eid)
+                            self.trade_logger.log_event(
+                                "PAPER_SETTLED",
+                                {
+                                    "event_id": eid,
+                                    "released_exposure_usdc": released,
+                                    "closed": True,
+                                    "reason": "gamma_event_closed",
+                                },
+                            )
+                        continue
+                    # Event not confirmed closed: keep it pinned so caps and books stay intact.
+                    pinned_group = existing_by_event.get(eid)
+                    if pinned_group is not None:
+                        merged_groups.append(pinned_group)
+                        merged_ids.add(eid)
+
+            token_ids = self.set_market_groups(merged_groups)
             active_token_set = set(token_ids)
             for cached_tid in list(self._books):
                 if cached_tid not in active_token_set:
@@ -727,6 +825,7 @@ class PaperTradingRunner:
                 + "): refusing to start a run that cannot produce any signal."
             )
         stop = stop_event if stop_event is not None else asyncio.Event()
+        self._backfill_missing_daily_summaries()
 
         groups = await self.discovery_client.discover_market_groups(limit=discovery_limit)
         token_ids = self.set_market_groups(groups)
@@ -819,6 +918,11 @@ class PaperTradingRunner:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            if self.daily_summary_enabled and self.write_summary_on_shutdown:
+                self.trade_logger.generate_daily_summary(
+                    date_str=self._last_summary_utc_date, write_to_log=True
+                )
+                self._stats["daily_summaries_emitted"] += 1
             self.trade_logger.log_heartbeat(self.get_heartbeat_stats())
 
         if fatal:
@@ -866,6 +970,7 @@ async def _run_cli() -> None:
         clob_ws_url=clob_ws_url,
         ws_receive_timeout_sec=ws_receive_timeout,
         daily_summary_enabled=daily_summary_enabled,
+        write_summary_on_shutdown=daily_summary_enabled,
         market_refresh_interval_sec=refresh_interval_sec,
     )
     await runner.run(stop_event=stop_event, discovery_limit=discovery_limit)

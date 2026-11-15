@@ -112,6 +112,8 @@ class ClobOrderBookStream:
         self._feed_lag_measured_at: datetime | None = None
         self._ignored_deltas = 0
         self._active_ws: Any | None = None
+        self._reconnect_event: asyncio.Event | None = None
+        self._resubscribe_requested: bool = False
 
     async def fetch_initial_snapshot(self, token_id: str) -> OrderBookSnapshot:
         """Fetch an initial L2 snapshot via GET /book?token_id=<token_id>."""
@@ -421,7 +423,7 @@ class ClobOrderBookStream:
             self._books[token_id] = snapshot.model_copy(update={"is_stale": True})
 
     async def update_tokens(self, token_ids: list[str]) -> list[str]:
-        """Update tracked token IDs, pruning closed tokens and snapshotting new ones."""
+        """Update tracked token IDs and trigger a clean WS reconnect when changed."""
         normalized = list(
             dict.fromkeys(str(tid).strip() for tid in token_ids if str(tid).strip())
         )
@@ -430,18 +432,31 @@ class ClobOrderBookStream:
         added = [tid for tid in normalized if tid not in previous_set]
         removed = [tid for tid in self.token_ids if tid not in new_set]
 
+        if not added and not removed:
+            return []
+
         self.token_ids = normalized
         for tid in removed:
             self._books.pop(tid, None)
 
         if added:
             await self._fetch_snapshots(added)
-            if self._active_ws is not None:
-                sub_payload = json.dumps({"assets_ids": self.token_ids, "type": "market"})
+
+        ws = self._active_ws
+        if ws is not None:
+            # Close the current WS so run() reconnects immediately with a clean full-list
+            # subscription rather than relying on incremental resubscribe support.
+            self._resubscribe_requested = True
+            if self._reconnect_event is not None:
+                self._reconnect_event.set()
+            close_fn = getattr(ws, "close", None)
+            if callable(close_fn):
                 try:
-                    await self._ws_send(self._active_ws, sub_payload)
+                    res = close_fn()
+                    if inspect.isawaitable(res):
+                        await res
                 except Exception:
-                    logger.warning("Failed to send updated WS subscription payload", exc_info=True)
+                    logger.debug("Ignoring WS close error during token update", exc_info=True)
 
         return added
 
@@ -512,6 +527,10 @@ class ClobOrderBookStream:
             if stop_event is not None:
                 stop_task = asyncio.create_task(stop_event.wait())
                 tasks.add(stop_task)
+            reconnect_task: asyncio.Task[bool] | None = None
+            if self._reconnect_event is not None:
+                reconnect_task = asyncio.create_task(self._reconnect_event.wait())
+                tasks.add(reconnect_task)
 
             timeout = (
                 self.receive_timeout_sec
@@ -523,16 +542,20 @@ class ClobOrderBookStream:
                     tasks, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
                 )
             finally:
-                if stop_task is not None and not stop_task.done():
-                    stop_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await stop_task
+                for aux_task in (stop_task, reconnect_task):
+                    if aux_task is not None and not aux_task.done():
+                        aux_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await aux_task
                 if not next_task.done():
                     next_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError, Exception):
                         await next_task
 
             if stop_event is not None and stop_event.is_set():
+                return
+
+            if reconnect_task is not None and reconnect_task in done:
                 return
 
             if not done and timeout is not None:
@@ -598,8 +621,11 @@ class ClobOrderBookStream:
 
         connector = ws_connect or websockets.connect
         backoff = 1.0
+        self._reconnect_event = asyncio.Event()
 
         while stop_event is None or not stop_event.is_set():
+            self._reconnect_event.clear()
+            self._resubscribe_requested = False
             try:
                 async with self._open_ws(connector) as ws:
                     self._active_ws = ws
@@ -626,13 +652,21 @@ class ClobOrderBookStream:
                 if stop_event is not None and stop_event.is_set():
                     break
                 self.mark_all_stale()
+                if self._resubscribe_requested:
+                    backoff = 1.0
+                    self._resubscribe_requested = False
+                    continue
             except asyncio.CancelledError:
                 raise
             except Exception:
                 if stop_event is not None and stop_event.is_set():
                     break
-                logger.warning("CLOB WebSocket connection lost; marking books stale", exc_info=True)
                 self.mark_all_stale()
+                if self._resubscribe_requested:
+                    backoff = 1.0
+                    self._resubscribe_requested = False
+                    continue
+                logger.warning("CLOB WebSocket connection lost; marking books stale", exc_info=True)
 
             if stop_event is not None and stop_event.is_set():
                 break

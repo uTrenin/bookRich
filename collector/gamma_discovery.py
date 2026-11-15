@@ -167,6 +167,34 @@ class GammaDiscoveryClient:
 
         return collected
 
+    async def is_event_closed(self, event_id: str) -> bool | None:
+        """Query Gamma explicitly to verify whether an event is closed/archived.
+
+        Returns True only when Gamma explicitly confirms closed/archived, False when
+        confirmed still open, and None when status cannot be verified (fail-safe).
+        """
+        target = str(event_id).strip()
+        if not target:
+            return None
+
+        url = f"{self.base_url}/events"
+        for param_key in ("id", "slug"):
+            try:
+                rows = self._extract_event_rows(await self._get_json(url, {param_key: target}))
+            except Exception:
+                return None
+            for row in rows:
+                row_id = str(row.get("id") or "").strip()
+                row_slug = str(row.get("slug") or "").strip()
+                if target not in {row_id, row_slug}:
+                    continue
+                if _parse_bool(row.get("closed"), default=False) or _parse_bool(
+                    row.get("archived"), default=False
+                ):
+                    return True
+                return False
+        return None
+
     def parse_market_groups(self, events_payload: list[dict[str, Any]]) -> list[MarketGroup]:
         """Parse raw Gamma event payloads into validated MarketGroup contracts."""
         groups: list[MarketGroup] = []
