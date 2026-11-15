@@ -6,6 +6,7 @@ import asyncio
 from datetime import datetime, timezone
 import importlib
 import inspect
+import json
 import logging
 import math
 import os
@@ -63,6 +64,24 @@ class EngineProtocol(Protocol):
         ...
 
 
+def _optional_float_env(name: str) -> float | None:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    return float(raw)
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 class DynamicEngineAdapter:
     """Lazily resolves /engine modules when present, failing safe when absent."""
 
@@ -74,9 +93,10 @@ class DynamicEngineAdapter:
         news_max_age_sec: float | None = None,
         bankroll_usdc: float | None = None,
         max_position_usdc: float | None = None,
-        fee_buffer: float = 0.0,
+        fee_buffer: float | None = None,
         slippage_buffer: float | None = None,
         min_executable_shares: float | None = None,
+        max_book_age_sec: float | None = None,
         fee_rate: float | None = None,
     ) -> None:
         self.target_shares: float = (
@@ -104,7 +124,11 @@ class DynamicEngineAdapter:
             if max_position_usdc is not None
             else float(os.getenv("MAX_POSITION_USDC", "50.0") or "50.0")
         )
-        self.fee_buffer: float = float(fee_buffer)
+        self.fee_buffer: float = (
+            float(fee_buffer)
+            if fee_buffer is not None
+            else float(os.getenv("FEE_BUFFER", "0.0") or "0.0")
+        )
         self.slippage_buffer: float = (
             float(slippage_buffer)
             if slippage_buffer is not None
@@ -116,10 +140,31 @@ class DynamicEngineAdapter:
             if fee_rate is not None
             else float(os.getenv("TAKER_FEE_BPS", "0") or "0") / 10_000.0
         )
-        for name, value in (("fee_rate", self.fee_rate), ("slippage_buffer", self.slippage_buffer)):
-            if not math.isfinite(value) or value < 0.0:
-                raise ValueError(f"{name} must be a finite non-negative number, got {value!r}")
-        self.min_executable_shares: float | None = min_executable_shares
+        for param_name, param_val in (
+            ("fee_buffer", self.fee_buffer),
+            ("fee_rate", self.fee_rate),
+            ("slippage_buffer", self.slippage_buffer),
+        ):
+            if not math.isfinite(param_val) or param_val < 0.0:
+                raise ValueError(
+                    f"{param_name} must be a finite non-negative number, got {param_val!r}"
+                )
+        self.min_executable_shares: float | None = (
+            float(min_executable_shares)
+            if min_executable_shares is not None
+            else _optional_float_env("MIN_EXECUTABLE_SHARES")
+        )
+        self.max_book_age_sec: float | None = (
+            float(max_book_age_sec)
+            if max_book_age_sec is not None
+            else _optional_float_env("MAX_BOOK_AGE_SEC")
+        )
+        if self.max_book_age_sec is not None and (
+            not math.isfinite(self.max_book_age_sec) or self.max_book_age_sec <= 0.0
+        ):
+            raise ValueError(
+                f"max_book_age_sec must be finite and > 0, got {self.max_book_age_sec!r}"
+            )
         self.current_exposure_usdc: float = 0.0
         self.event_exposure_usdc: dict[str, float] = {}
 
@@ -232,6 +277,13 @@ class DynamicEngineAdapter:
                 self.event_exposure_usdc.get(signal.event_id, 0.0) + cost
             )
 
+    def release_event_exposure(self, event_id: str) -> float:
+        """Release virtual exposure for a settled/closed event, returning released USDC."""
+        released = float(self.event_exposure_usdc.pop(event_id, 0.0))
+        if released > 0.0:
+            self.current_exposure_usdc = max(0.0, self.current_exposure_usdc - released)
+        return released
+
     def evaluate_group(
         self,
         group: MarketGroup,
@@ -319,6 +371,10 @@ class DynamicEngineAdapter:
             else float(current_event_exposure_usdc)
         )
 
+        eval_now = now
+        if eval_now is None and self.max_book_age_sec is not None:
+            eval_now = datetime.now(timezone.utc)
+
         pos_params, params, has_var_pos, has_var_kw = self._inspect_signature(self._risk_approve)
         args: tuple[Any, ...] = (signal, books)
         candidates: dict[str, Any] = {
@@ -326,8 +382,10 @@ class DynamicEngineAdapter:
             "bankroll_usdc": self.bankroll_usdc,
             "max_event_exposure_usdc": self.max_position_usdc,
             "fee_rate": self.fee_rate,
-            "now": now,
+            "now": eval_now,
         }
+        if self.max_book_age_sec is not None:
+            candidates["max_book_age_sec"] = self.max_book_age_sec
 
         exp_param = params.get("current_exposure_usdc")
         if exp_param is not None:
@@ -372,20 +430,36 @@ class PaperTradingRunner:
         news_feed_urls: list[str] | None = None,
         log_path: str | Path = "logs/paper_trades.jsonl",
         rejection_log_interval_sec: float = 60.0,
+        gamma_url: str | None = None,
+        clob_rest_url: str | None = None,
+        clob_ws_url: str | None = None,
+        ws_receive_timeout_sec: float | None = None,
+        daily_summary_enabled: bool = True,
+        write_summary_on_shutdown: bool = False,
+        market_refresh_interval_sec: float = 0.0,
     ) -> None:
         validate_paper_only_safety()
 
         self._book_stream_injected = book_stream is not None
         self._news_collector_injected = news_collector is not None
 
-        self.discovery_client = (
-            discovery_client
-            if discovery_client is not None
-            else GammaDiscoveryClient(min_liquidity_usdc=min_liquidity_usdc)
-        )
+        if discovery_client is not None:
+            self.discovery_client = discovery_client
+        else:
+            disc_kwargs: dict[str, Any] = {"min_liquidity_usdc": min_liquidity_usdc}
+            if gamma_url:
+                disc_kwargs["base_url"] = gamma_url
+            self.discovery_client = GammaDiscoveryClient(**disc_kwargs)
         self.book_stream = book_stream
         self.news_collector = news_collector
         self._news_feed_urls = list(news_feed_urls) if news_feed_urls else []
+        self._clob_rest_url = clob_rest_url
+        self._clob_ws_url = clob_ws_url
+        self._ws_receive_timeout_sec = ws_receive_timeout_sec
+        self.daily_summary_enabled = bool(daily_summary_enabled)
+        self.write_summary_on_shutdown = bool(write_summary_on_shutdown)
+        self.market_refresh_interval_sec = float(market_refresh_interval_sec)
+        self._last_summary_utc_date = datetime.now(timezone.utc).date().isoformat()
         self.engine: EngineProtocol = (
             engine if engine is not None else DynamicEngineAdapter()
         )
@@ -414,6 +488,8 @@ class PaperTradingRunner:
             "fills_executed": 0,
             "fills_rejected": 0,
             "rejections_not_logged": 0,
+            "daily_summaries_emitted": 0,
+            "events_settled": 0,
         }
         # Once an event hits its exposure cap, every later book update re-triggers the same
         # rejection: log it at most once per interval and count the rest.
@@ -602,6 +678,143 @@ class PaperTradingRunner:
                 self._stats["fills_rejected"] += 1
             return fill
 
+    def _backfill_missing_daily_summaries(self, now: datetime | None = None) -> list[dict[str, Any]]:
+        """Generate missing DAILY_SUMMARY entries for past UTC dates already in the JSONL log."""
+        if not self.daily_summary_enabled:
+            return []
+        log_path = getattr(self.trade_logger, "log_path", None)
+        if not isinstance(log_path, Path) or not log_path.exists():
+            return []
+
+        today_utc = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).date().isoformat()
+        dates_with_events: set[str] = set()
+        dates_with_summary: set[str] = set()
+
+        for line in log_path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                entry = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            event_type = entry.get("event_type")
+            payload = entry.get("payload")
+            if event_type == "DAILY_SUMMARY" and isinstance(payload, dict):
+                summary_date = str(payload.get("date") or "").strip()
+                if summary_date:
+                    dates_with_summary.add(summary_date)
+                continue
+            ts_raw = entry.get("ts")
+            if isinstance(ts_raw, str):
+                try:
+                    parsed = datetime.fromisoformat(ts_raw)
+                except ValueError:
+                    continue
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                entry_date = parsed.astimezone(timezone.utc).date().isoformat()
+                if entry_date < today_utc:
+                    dates_with_events.add(entry_date)
+
+        emitted: list[dict[str, Any]] = []
+        for missing_date in sorted(dates_with_events - dates_with_summary):
+            summary = self.trade_logger.generate_daily_summary(
+                date_str=missing_date, write_to_log=True
+            )
+            self._stats["daily_summaries_emitted"] += 1
+            emitted.append(summary)
+        return emitted
+
+    def _maybe_emit_daily_summary(self, now: datetime | None = None) -> dict[str, Any] | None:
+        """Emit DAILY_SUMMARY for the previous UTC date whenever the UTC day rolls over."""
+        if not self.daily_summary_enabled:
+            return None
+        current_utc_date = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).date().isoformat()
+        if current_utc_date == self._last_summary_utc_date:
+            return None
+        prev_date = self._last_summary_utc_date
+        self._last_summary_utc_date = current_utc_date
+        summary = self.trade_logger.generate_daily_summary(date_str=prev_date, write_to_log=True)
+        self._stats["daily_summaries_emitted"] += 1
+        return summary
+
+    async def refresh_markets_once(self, discovery_limit: int = 50) -> tuple[list[str], list[str]]:
+        """Refresh active MarketGroup subscriptions, pinning exposed events unless Gamma closes them."""
+        new_groups = await self.discovery_client.discover_market_groups(limit=discovery_limit)
+        if not new_groups:
+            if self._market_groups:
+                logger.warning("Gamma discovery refresh returned 0 groups; keeping existing subscriptions.")
+            return [], []
+
+        new_event_ids = {group.event_id for group in new_groups}
+        tracked_exposures = getattr(self.engine, "event_exposure_usdc", None)
+        candidate_missing_ids: list[str] = []
+        if isinstance(tracked_exposures, dict):
+            candidate_missing_ids = [
+                eid
+                for eid, amount in list(tracked_exposures.items())
+                if eid not in new_event_ids and float(amount) > 0.0
+            ]
+
+        closed_lookup: dict[str, bool] = {}
+        is_closed_fn = getattr(self.discovery_client, "is_event_closed", None)
+        if callable(is_closed_fn) and candidate_missing_ids:
+            for eid in candidate_missing_ids:
+                try:
+                    closed = await is_closed_fn(eid)
+                except Exception:
+                    closed = None
+                if closed is True:
+                    closed_lookup[eid] = True
+
+        settled_events: list[str] = []
+        async with self._eval_lock:
+            existing_by_event = {group.event_id: group for group in self._market_groups}
+            merged_groups = list(new_groups)
+            merged_ids = {group.event_id for group in merged_groups}
+
+            tracked_exposures = getattr(self.engine, "event_exposure_usdc", None)
+            if isinstance(tracked_exposures, dict):
+                for eid, amount in list(tracked_exposures.items()):
+                    if float(amount) <= 0.0 or eid in merged_ids:
+                        continue
+                    if closed_lookup.get(eid) is True and hasattr(
+                        self.engine, "release_event_exposure"
+                    ):
+                        released = float(self.engine.release_event_exposure(eid))
+                        if released > 0.0:
+                            self._stats["events_settled"] += 1
+                            settled_events.append(eid)
+                            self.trade_logger.log_event(
+                                "PAPER_SETTLED",
+                                {
+                                    "event_id": eid,
+                                    "released_exposure_usdc": released,
+                                    "closed": True,
+                                    "reason": "gamma_event_closed",
+                                },
+                            )
+                        continue
+                    # Event not confirmed closed: keep it pinned so caps and books stay intact.
+                    pinned_group = existing_by_event.get(eid)
+                    if pinned_group is not None:
+                        merged_groups.append(pinned_group)
+                        merged_ids.add(eid)
+
+            token_ids = self.set_market_groups(merged_groups)
+            active_token_set = set(token_ids)
+            for cached_tid in list(self._books):
+                if cached_tid not in active_token_set:
+                    self._books.pop(cached_tid, None)
+
+        if self.book_stream is not None and hasattr(self.book_stream, "update_tokens"):
+            await self.book_stream.update_tokens(token_ids)
+
+        return token_ids, settled_events
+
     async def _heartbeat_loop(self, stop_event: asyncio.Event) -> None:
         while not stop_event.is_set():
             try:
@@ -610,7 +823,22 @@ class PaperTradingRunner:
                 )
                 break
             except asyncio.TimeoutError:
+                self._maybe_emit_daily_summary()
                 self.trade_logger.log_heartbeat(self.get_heartbeat_stats())
+
+    async def _market_refresh_loop(self, stop_event: asyncio.Event, discovery_limit: int) -> None:
+        interval = max(1.0, self.market_refresh_interval_sec)
+        while not stop_event.is_set():
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+                break
+            except asyncio.TimeoutError:
+                try:
+                    await self.refresh_markets_once(discovery_limit=discovery_limit)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.warning("Periodic Gamma discovery refresh failed", exc_info=True)
 
     async def run(
         self,
@@ -627,15 +855,23 @@ class PaperTradingRunner:
                 + "): refusing to start a run that cannot produce any signal."
             )
         stop = stop_event if stop_event is not None else asyncio.Event()
+        self._backfill_missing_daily_summaries()
 
         groups = await self.discovery_client.discover_market_groups(limit=discovery_limit)
         token_ids = self.set_market_groups(groups)
 
         if self.book_stream is None:
-            self.book_stream = ClobOrderBookStream(
-                token_ids=token_ids,
-                on_book_update=self.handle_book_update,
-            )
+            stream_kwargs: dict[str, Any] = {
+                "token_ids": token_ids,
+                "on_book_update": self.handle_book_update,
+            }
+            if self._clob_rest_url:
+                stream_kwargs["rest_url"] = self._clob_rest_url
+            if self._clob_ws_url:
+                stream_kwargs["ws_url"] = self._clob_ws_url
+            if self._ws_receive_timeout_sec is not None:
+                stream_kwargs["receive_timeout_sec"] = self._ws_receive_timeout_sec
+            self.book_stream = ClobOrderBookStream(**stream_kwargs)
         elif getattr(self.book_stream, "on_book_update", None) is None:
             self.book_stream.on_book_update = self.handle_book_update
 
@@ -651,6 +887,13 @@ class PaperTradingRunner:
         tasks: list[asyncio.Task[Any]] = [
             asyncio.create_task(self._heartbeat_loop(stop), name="paper_heartbeat")
         ]
+        if self.market_refresh_interval_sec > 0.0:
+            tasks.append(
+                asyncio.create_task(
+                    self._market_refresh_loop(stop, discovery_limit=discovery_limit),
+                    name="market_discovery_refresh",
+                )
+            )
 
         stream_tokens = getattr(self.book_stream, "token_ids", token_ids)
         if stream_tokens or self._book_stream_injected:
@@ -705,6 +948,11 @@ class PaperTradingRunner:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            if self.daily_summary_enabled and self.write_summary_on_shutdown:
+                self.trade_logger.generate_daily_summary(
+                    date_str=self._last_summary_utc_date, write_to_log=True
+                )
+                self._stats["daily_summaries_emitted"] += 1
             self.trade_logger.log_heartbeat(self.get_heartbeat_stats())
 
         if fatal:
@@ -733,12 +981,27 @@ async def _run_cli() -> None:
     min_liq = float(os.getenv("MIN_LIQUIDITY_USDC", "0.0") or "0.0")
     discovery_limit = int(os.getenv("DISCOVERY_LIMIT", "50") or "50")
     heartbeat_sec = float(os.getenv("HEARTBEAT_INTERVAL_SEC", "60.0") or "60.0")
+    gamma_url = os.getenv("POLYMARKET_GAMMA_URL", "").strip() or None
+    clob_rest_url = os.getenv("POLYMARKET_CLOB_URL", "").strip() or None
+    clob_ws_url = os.getenv("POLYMARKET_WS_URL", "").strip() or None
+    ws_receive_timeout = _optional_float_env("WS_RECEIVE_TIMEOUT_SEC")
+    if ws_receive_timeout is None:
+        ws_receive_timeout = 30.0
+    refresh_interval_sec = float(os.getenv("MARKET_REFRESH_INTERVAL_SEC", "1800.0") or "1800.0")
+    daily_summary_enabled = _bool_env("DAILY_SUMMARY_ENABLED", True)
 
     runner = PaperTradingRunner(
         min_liquidity_usdc=min_liq,
         news_feed_urls=_parse_feed_urls_from_env(),
         heartbeat_interval_sec=heartbeat_sec,
         log_path=log_path,
+        gamma_url=gamma_url,
+        clob_rest_url=clob_rest_url,
+        clob_ws_url=clob_ws_url,
+        ws_receive_timeout_sec=ws_receive_timeout,
+        daily_summary_enabled=daily_summary_enabled,
+        write_summary_on_shutdown=daily_summary_enabled,
+        market_refresh_interval_sec=refresh_interval_sec,
     )
     await runner.run(stop_event=stop_event, discovery_limit=discovery_limit)
 
