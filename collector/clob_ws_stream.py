@@ -86,6 +86,7 @@ class ClobOrderBookStream:
         rest_concurrency: int = 8,
         resync_grace_sec: float = 5.0,
         receive_timeout_sec: float | None = None,
+        ws_connect: Callable[..., Any] | None = None,
     ) -> None:
         self.token_ids = list(dict.fromkeys(str(tid).strip() for tid in token_ids if str(tid).strip()))
         self.rest_url = rest_url.rstrip("/")
@@ -112,6 +113,9 @@ class ClobOrderBookStream:
         self._feed_lag_measured_at: datetime | None = None
         self._ignored_deltas = 0
         self._active_ws: Any | None = None
+        # Default WebSocket connector for run(); lets a recorder or a replay wrap the socket
+        # without the runner having to know about it.
+        self._ws_connect = ws_connect
         self._reconnect_event: asyncio.Event | None = None
         self._resubscribe_requested: bool = False
 
@@ -624,7 +628,7 @@ class ClobOrderBookStream:
             # Per-token failures are logged, never raised: the reconnect loop must always start.
             await self.initialize_books()
 
-        connector = ws_connect or websockets.connect
+        connector = ws_connect or self._ws_connect or websockets.connect
         backoff = 1.0
         self._reconnect_event = asyncio.Event()
 
