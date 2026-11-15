@@ -66,9 +66,13 @@ class PaperTradeLogger:
         fill: PaperFill,
         signal: TradeSignal | None = None,
         news_published_at: datetime | None = None,
+        fees_usdc: float | None = None,
     ) -> dict[str, Any]:
         """Log a simulated PaperFill (PAPER_FILL when FILLED, else SIGNAL_REJECTED)."""
         payload: dict[str, Any] = fill.model_dump(mode="json")
+        if fees_usdc is not None:
+            # Already included in actual_simulated_cost_usdc; logged apart to analyse costs.
+            payload["fees_usdc"] = fees_usdc
 
         if signal is not None:
             payload["event_id"] = signal.event_id
@@ -125,6 +129,7 @@ class PaperTradeLogger:
         rejections_count = 0
         heartbeats_count = 0
         total_virtual_cost_usdc = 0.0
+        total_fees_usdc = 0.0
         slippage_values: list[float] = []
         latency_values: list[float] = []
         expected_edge_values: list[float] = []
@@ -163,6 +168,7 @@ class PaperTradeLogger:
                     total_virtual_cost_usdc += float(
                         payload.get("actual_simulated_cost_usdc", 0.0) or 0.0
                     )
+                    total_fees_usdc += float(payload.get("fees_usdc", 0.0) or 0.0)
                     slippage_values.append(float(payload.get("slippage_vs_best_ask", 0.0) or 0.0))
                     strategy = str(payload.get("strategy", "UNKNOWN"))
                     fills_by_strategy[strategy] = fills_by_strategy.get(strategy, 0) + 1
@@ -195,6 +201,7 @@ class PaperTradeLogger:
             "rejections_count": rejections_count,
             "heartbeats_count": heartbeats_count,
             "total_virtual_cost_usdc": total_virtual_cost_usdc,
+            "total_fees_usdc": total_fees_usdc,
             "avg_slippage_vs_best_ask": avg_slippage,
             "avg_news_latency_ms": avg_news_latency_ms,
             "news_latency_samples": len(latency_values),

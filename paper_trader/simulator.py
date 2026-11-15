@@ -11,8 +11,18 @@ from contracts.models import BookLevel, OrderBookSnapshot, OrderLeg, PaperFill, 
 class PaperOrderSimulator:
     """Simulates realistic multi-level L2 execution without signing or sending orders."""
 
-    def __init__(self, fill_tolerance: float = 1e-9, price_tolerance: float = 1e-12) -> None:
+    def __init__(
+        self,
+        fill_tolerance: float = 1e-9,
+        price_tolerance: float = 1e-12,
+        fee_rate: float = 0.0,
+    ) -> None:
+        if not math.isfinite(fee_rate) or fee_rate < 0.0:
+            raise ValueError(f"fee_rate must be a finite non-negative fraction, got {fee_rate!r}")
         self.fill_tolerance = fill_tolerance
+        # Taker fee as a fraction of the traded notional (0.02 = 2%). Must match the rate the
+        # engine used to compute the edge, or the log would overstate what a fill really costs.
+        self.fee_rate = float(fee_rate)
         self.price_tolerance = price_tolerance
 
     def simulate_signal(
@@ -147,16 +157,20 @@ class PaperOrderSimulator:
         slippage_vs_best_ask = (
             weighted_slippage_sum / total_shares if total_shares > 0.0 else 0.0
         )
+        fees_usdc = total_cost_usdc * self.fee_rate
+        note = f"Simulated {len(filled_legs)} leg(s) against L2 order book"
+        if self.fee_rate > 0.0:
+            note += f"; taker fee {fees_usdc:.4f} USDC ({self.fee_rate:.4%}) included in cost"
 
         return PaperFill(
             signal_id=signal.signal_id,
             strategy=signal.strategy,
             executed_at=exec_ts,
             filled_legs=filled_legs,
-            actual_simulated_cost_usdc=total_cost_usdc,
+            actual_simulated_cost_usdc=total_cost_usdc + fees_usdc,
             slippage_vs_best_ask=slippage_vs_best_ask,
             status="FILLED",
-            note=f"Simulated {len(filled_legs)} leg(s) against L2 order book",
+            note=note,
         )
 
     @staticmethod
