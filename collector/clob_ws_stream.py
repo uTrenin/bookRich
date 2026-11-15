@@ -85,6 +85,7 @@ class ClobOrderBookStream:
         max_feed_lag_sec: float | None = None,
         rest_concurrency: int = 8,
         resync_grace_sec: float = 5.0,
+        receive_timeout_sec: float | None = None,
     ) -> None:
         self.token_ids = list(dict.fromkeys(str(tid).strip() for tid in token_ids if str(tid).strip()))
         self.rest_url = rest_url.rstrip("/")
@@ -101,12 +102,16 @@ class ClobOrderBookStream:
         )
         self.rest_concurrency = max(1, int(rest_concurrency))
         self.resync_grace_sec = float(resync_grace_sec)
+        self.receive_timeout_sec = (
+            float(receive_timeout_sec) if receive_timeout_sec is not None else None
+        )
         # Local receive time of the latest WS frame (PONG included): proof the connection is alive.
         self._last_message_at: datetime | None = None
         # Lag between exchange event time and local processing time, from price_change events.
         self._feed_lag_sec: float | None = None
         self._feed_lag_measured_at: datetime | None = None
         self._ignored_deltas = 0
+        self._active_ws: Any | None = None
 
     async def fetch_initial_snapshot(self, token_id: str) -> OrderBookSnapshot:
         """Fetch an initial L2 snapshot via GET /book?token_id=<token_id>."""
@@ -415,6 +420,31 @@ class ClobOrderBookStream:
         for token_id, snapshot in list(self._books.items()):
             self._books[token_id] = snapshot.model_copy(update={"is_stale": True})
 
+    async def update_tokens(self, token_ids: list[str]) -> list[str]:
+        """Update tracked token IDs, pruning closed tokens and snapshotting new ones."""
+        normalized = list(
+            dict.fromkeys(str(tid).strip() for tid in token_ids if str(tid).strip())
+        )
+        previous_set = set(self.token_ids)
+        new_set = set(normalized)
+        added = [tid for tid in normalized if tid not in previous_set]
+        removed = [tid for tid in self.token_ids if tid not in new_set]
+
+        self.token_ids = normalized
+        for tid in removed:
+            self._books.pop(tid, None)
+
+        if added:
+            await self._fetch_snapshots(added)
+            if self._active_ws is not None:
+                sub_payload = json.dumps({"assets_ids": self.token_ids, "type": "market"})
+                try:
+                    await self._ws_send(self._active_ws, sub_payload)
+                except Exception:
+                    logger.warning("Failed to send updated WS subscription payload", exc_info=True)
+
+        return added
+
     async def _ws_send(self, ws: Any, payload: str) -> None:
         """Send a payload to a WebSocket object supporting sync or async send."""
         res = ws.send(payload)
@@ -483,8 +513,15 @@ class ClobOrderBookStream:
                 stop_task = asyncio.create_task(stop_event.wait())
                 tasks.add(stop_task)
 
+            timeout = (
+                self.receive_timeout_sec
+                if self.receive_timeout_sec is not None and self.receive_timeout_sec > 0.0
+                else None
+            )
             try:
-                done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                done, _ = await asyncio.wait(
+                    tasks, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+                )
             finally:
                 if stop_task is not None and not stop_task.done():
                     stop_task.cancel()
@@ -497,6 +534,11 @@ class ClobOrderBookStream:
 
             if stop_event is not None and stop_event.is_set():
                 return
+
+            if not done and timeout is not None:
+                raise asyncio.TimeoutError(
+                    f"CLOB WebSocket idle for {timeout:.1f}s; reconnecting"
+                )
 
             if ping_task in done:
                 exc = ping_task.exception()
@@ -560,6 +602,7 @@ class ClobOrderBookStream:
         while stop_event is None or not stop_event.is_set():
             try:
                 async with self._open_ws(connector) as ws:
+                    self._active_ws = ws
                     sub_payload = json.dumps({"assets_ids": self.token_ids, "type": "market"})
                     await self._ws_send(ws, sub_payload)
 
@@ -574,6 +617,7 @@ class ClobOrderBookStream:
                             if stop_event is not None and stop_event.is_set():
                                 break
                     finally:
+                        self._active_ws = None
                         for task in (ping_task, resync_task):
                             task.cancel()
                             with contextlib.suppress(asyncio.CancelledError, Exception):

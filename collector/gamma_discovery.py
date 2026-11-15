@@ -100,30 +100,72 @@ class GammaDiscoveryClient:
         self.timeout = float(timeout)
         self._http_client = http_client
 
-    async def fetch_active_events(self, limit: int = 100) -> list[dict[str, Any]]:
-        """Fetch active, non-closed events from Gamma API."""
-        url = f"{self.base_url}/events"
-        params = {
-            "active": "true",
-            "closed": "false",
-            "limit": int(limit),
-        }
-
+    async def _get_json(self, url: str, params: dict[str, Any]) -> Any:
+        """Execute a GET request reusing injected AsyncClient when present."""
         if self._http_client is not None:
             response = await self._http_client.get(url, params=params)
             response.raise_for_status()
-            payload = response.json()
-        else:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.get(url, params=params)
-                response.raise_for_status()
-                payload = response.json()
+            return response.json()
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.get(url, params=params)
+            response.raise_for_status()
+            return response.json()
 
+    @staticmethod
+    def _extract_event_rows(payload: Any) -> list[dict[str, Any]]:
         if isinstance(payload, list):
             return [item for item in payload if isinstance(item, dict)]
         if isinstance(payload, dict) and isinstance(payload.get("data"), list):
             return [item for item in payload["data"] if isinstance(item, dict)]
         return []
+
+    async def fetch_active_events(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        page_size: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Fetch active, non-closed events from Gamma API with optional pagination."""
+        url = f"{self.base_url}/events"
+        target_limit = max(1, int(limit))
+        current_offset = max(0, int(offset))
+        effective_page_size = max(1, int(page_size))
+
+        if target_limit <= effective_page_size and current_offset == 0:
+            params: dict[str, Any] = {
+                "active": "true",
+                "closed": "false",
+                "limit": target_limit,
+            }
+            return self._extract_event_rows(await self._get_json(url, params))
+
+        collected: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        while len(collected) < target_limit:
+            batch_limit = min(effective_page_size, target_limit - len(collected))
+            params = {
+                "active": "true",
+                "closed": "false",
+                "limit": batch_limit,
+                "offset": current_offset,
+            }
+            rows = self._extract_event_rows(await self._get_json(url, params))
+            if not rows:
+                break
+            for row in rows:
+                event_id = str(row.get("id") or row.get("slug") or "").strip()
+                if event_id:
+                    if event_id in seen_ids:
+                        continue
+                    seen_ids.add(event_id)
+                collected.append(row)
+                if len(collected) >= target_limit:
+                    break
+            if len(rows) < batch_limit:
+                break
+            current_offset += len(rows)
+
+        return collected
 
     def parse_market_groups(self, events_payload: list[dict[str, Any]]) -> list[MarketGroup]:
         """Parse raw Gamma event payloads into validated MarketGroup contracts."""

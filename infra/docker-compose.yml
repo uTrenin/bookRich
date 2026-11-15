@@ -1,0 +1,21 @@
+services:
+  paper-bot:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile
+    container_name: polymarket-paper-bot
+    env_file:
+      - path: ../.env
+        required: false
+    environment:
+      PAPER_ONLY: "true"
+      PYTHONUNBUFFERED: "1"
+      LOG_FILE_PATH: /app/logs/paper_trades.jsonl
+    volumes:
+      - ../logs:/app/logs
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
