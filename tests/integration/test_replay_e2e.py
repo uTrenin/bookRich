@@ -291,6 +291,21 @@ async def test_replay_session_end_to_end(tmp_path: Path) -> None:
     assert result.total_exposure_usdc == pytest.approx(122.25)
     assert result.log_entries[-1]["event_type"] == "HEARTBEAT_STATS"
 
+    # --- virtual P&L at the end of the session (best bids of the last snapshot)
+    pnl = result.stats["pnl"]
+    fed_shares = 50.0 / 0.55
+    market_value = 2 * 25 * (0.51 + 0.48) + 25 * (0.38 + 0.33 + 0.27) + fed_shares * 0.53
+    assert pnl["open_lots"] == 4
+    assert pnl["cost_basis_usdc"] == pytest.approx(122.25)
+    assert pnl["market_value_usdc"] == pytest.approx(market_value)
+    assert pnl["unrealized_pnl_usdc"] == pytest.approx(market_value - 122.25)  # about -0.07 USDC
+    # The three arbitrage lots are worth 75 USDC at resolution whoever wins: +0.75, +0.75, +1.25.
+    assert pnl["locked_arb_pnl_usdc"] == pytest.approx(2.75)
+    assert pnl["realized_pnl_usdc"] == 0.0
+    assert pnl["unpriced_tokens"] == 0
+    assert pnl["equity_usdc"] == pytest.approx(1000.0 + market_value - 122.25)
+    assert result.log_entries[-1]["payload"]["pnl"]["locked_arb_pnl_usdc"] == pytest.approx(2.75)
+
 
 @pytest.mark.asyncio
 async def test_replay_session_with_a_two_percent_taker_fee(tmp_path: Path) -> None:
@@ -323,3 +338,7 @@ async def test_replay_session_with_a_two_percent_taker_fee(tmp_path: Path) -> No
     assert result.stats["signals_generated"] == 2
     assert result.stats["signals_rejected_risk"] == 0
     assert result.exposure_by_event == pytest.approx({"50202": 23.75 * 1.02, "50404": 50.0})
+
+    pnl = result.stats["pnl"]
+    assert pnl["fees_paid_usdc"] == pytest.approx(23.75 * 0.02 + 50.0 * 0.02 / 1.02)
+    assert pnl["locked_arb_pnl_usdc"] == pytest.approx(25.0 - 23.75 * 1.02)  # the fee eats into the lock

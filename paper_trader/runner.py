@@ -26,6 +26,7 @@ from contracts.models import (
     TradeSignal,
 )
 from paper_trader.logger import PaperTradeLogger
+from paper_trader.portfolio import PaperPortfolio
 from paper_trader.simulator import PaperOrderSimulator
 
 logger = logging.getLogger(__name__)
@@ -474,6 +475,13 @@ class PaperTradingRunner:
             trade_logger if trade_logger is not None else PaperTradeLogger(log_path=log_path)
         )
         self.heartbeat_interval_sec = heartbeat_interval_sec
+        # Virtual P&L ledger. run() rebuilds it from the log, so a restart does not reset it.
+        engine_bankroll = getattr(self.engine, "bankroll_usdc", None)
+        self.portfolio = PaperPortfolio(
+            starting_bankroll_usdc=float(engine_bankroll)
+            if isinstance(engine_bankroll, (int, float)) and not isinstance(engine_bankroll, bool)
+            else float(os.getenv("PAPER_STARTING_BANKROLL_USDC", "1000.0") or "1000.0")
+        )
 
         self._books: dict[str, OrderBookSnapshot] = dict(books) if books else {}
         self._market_groups: list[MarketGroup] = []
@@ -536,7 +544,33 @@ class PaperTradingRunner:
         ignored = getattr(self.book_stream, "ignored_delta_count", None)
         if isinstance(ignored, int) and not isinstance(ignored, bool):
             stats["ws_deltas_ignored"] = ignored
+        stats["pnl"] = self.portfolio.snapshot(self._books)
         return stats
+
+    def _record_position(self, signal: TradeSignal, fill: PaperFill, books: dict[str, OrderBookSnapshot]) -> None:
+        """Add a filled signal to the virtual portfolio and sample equity for the drawdown."""
+        if fill.status != "FILLED":
+            return
+        self.portfolio.record_fill(signal, fill, fees_usdc=self._fees_paid(fill))
+        self.portfolio.snapshot(books)
+
+    def _restore_portfolio_from_log(self) -> int:
+        """Rebuild open positions from the JSONL log after a restart; returns lots restored."""
+        log_file = getattr(self.trade_logger, "log_path", None)
+        if not isinstance(log_file, Path):
+            return 0
+        if self.portfolio.open_lots or self.portfolio.settled_lots:
+            return 0  # already tracking positions in this process
+        restored = PaperPortfolio.from_log(
+            log_file, starting_bankroll_usdc=self.portfolio.starting_bankroll_usdc
+        )
+        if restored.open_lots or restored.settled_lots:
+            self.portfolio = restored
+            logger.info(
+                "Portfolio restored from %s: %d open lot(s), %d settled",
+                log_file, len(restored.open_lots), restored.settled_lots,
+            )
+        return len(restored.open_lots)
 
     def _fees_paid(self, fill: PaperFill) -> float | None:
         """Taker fees inside a fill's simulated cost (None when the simulator has no rate)."""
@@ -600,6 +634,7 @@ class PaperTradingRunner:
                 fill = self.simulator.simulate_signal(signal, books_view)
                 if fill.status == "FILLED" and hasattr(self.engine, "record_fill"):
                     self.engine.record_fill(signal, fill)
+                self._record_position(signal, fill, books_view)
                 self.trade_logger.log_paper_fill(fill, signal=signal, fees_usdc=self._fees_paid(fill))
                 if fill.status == "FILLED":
                     self._stats["fills_executed"] += 1
@@ -666,6 +701,7 @@ class PaperTradingRunner:
             fill = self.simulator.simulate_signal(signal, books_view)
             if fill.status == "FILLED" and hasattr(self.engine, "record_fill"):
                 self.engine.record_fill(signal, fill)
+            self._record_position(signal, fill, books_view)
             self.trade_logger.log_paper_fill(
                 fill,
                 signal=signal,
@@ -737,7 +773,9 @@ class PaperTradingRunner:
             return None
         prev_date = self._last_summary_utc_date
         self._last_summary_utc_date = current_utc_date
-        summary = self.trade_logger.generate_daily_summary(date_str=prev_date, write_to_log=True)
+        summary = self.trade_logger.generate_daily_summary(
+            date_str=prev_date, write_to_log=True, portfolio=self.portfolio.snapshot(self._books)
+        )
         self._stats["daily_summaries_emitted"] += 1
         return summary
 
@@ -788,6 +826,9 @@ class PaperTradingRunner:
                         if released > 0.0:
                             self._stats["events_settled"] += 1
                             settled_events.append(eid)
+                            # Arbitrage sets pay 1 per set whoever wins, so they are realized
+                            # here; single-outcome positions wait for the actual result.
+                            settlement = self.portfolio.settle_event(eid)
                             self.trade_logger.log_event(
                                 "PAPER_SETTLED",
                                 {
@@ -795,6 +836,7 @@ class PaperTradingRunner:
                                     "released_exposure_usdc": released,
                                     "closed": True,
                                     "reason": "gamma_event_closed",
+                                    **settlement,
                                 },
                             )
                         continue
@@ -855,6 +897,7 @@ class PaperTradingRunner:
                 + "): refusing to start a run that cannot produce any signal."
             )
         stop = stop_event if stop_event is not None else asyncio.Event()
+        self._restore_portfolio_from_log()
         self._backfill_missing_daily_summaries()
 
         groups = await self.discovery_client.discover_market_groups(limit=discovery_limit)
@@ -950,7 +993,9 @@ class PaperTradingRunner:
             await asyncio.gather(*tasks, return_exceptions=True)
             if self.daily_summary_enabled and self.write_summary_on_shutdown:
                 self.trade_logger.generate_daily_summary(
-                    date_str=self._last_summary_utc_date, write_to_log=True
+                    date_str=self._last_summary_utc_date,
+                    write_to_log=True,
+                    portfolio=self.portfolio.snapshot(self._books),
                 )
                 self._stats["daily_summaries_emitted"] += 1
             self.trade_logger.log_heartbeat(self.get_heartbeat_stats())
