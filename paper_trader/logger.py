@@ -121,6 +121,7 @@ class PaperTradeLogger:
         self,
         date_str: str | None = None,
         write_to_log: bool = True,
+        portfolio: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Aggregate fills, rejections, slippage, virtual cost, and news latency for a UTC date."""
         target_date = date_str or datetime.now(timezone.utc).date().isoformat()
@@ -209,6 +210,9 @@ class PaperTradeLogger:
             "fills_by_strategy": fills_by_strategy,
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }
+        if portfolio is not None:
+            # P&L picture at the moment the summary is written (not a per-day figure).
+            summary["portfolio"] = dict(portfolio)
 
         if write_to_log:
             self.log_event("DAILY_SUMMARY", summary)
