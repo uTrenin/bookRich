@@ -278,6 +278,24 @@ class DynamicEngineAdapter:
                 self.event_exposure_usdc.get(signal.event_id, 0.0) + cost
             )
 
+    def restore_exposure(self, exposure_by_event: dict[str, float]) -> float:
+        """Load per-event exposure rebuilt from the log; returns the total restored.
+
+        Exposure lives in memory only, so without this a restart forgets every cap already
+        reached and the bot can buy again on the same events.
+        """
+        restored: dict[str, float] = {}
+        for event_id, amount in exposure_by_event.items():
+            try:
+                value = float(amount)
+            except (TypeError, ValueError):
+                continue
+            if event_id and math.isfinite(value) and value > 0.0:
+                restored[str(event_id)] = value
+        self.event_exposure_usdc = restored
+        self.current_exposure_usdc = sum(restored.values())
+        return self.current_exposure_usdc
+
     def release_event_exposure(self, event_id: str) -> float:
         """Release virtual exposure for a settled/closed event, returning released USDC."""
         released = float(self.event_exposure_usdc.pop(event_id, 0.0))
@@ -570,7 +588,24 @@ class PaperTradingRunner:
                 "Portfolio restored from %s: %d open lot(s), %d settled",
                 log_file, len(restored.open_lots), restored.settled_lots,
             )
+            self._restore_engine_exposure()
         return len(restored.open_lots)
+
+    def _restore_engine_exposure(self) -> float:
+        """Give the risk manager back the exposure of positions opened before a restart."""
+        restore = getattr(self.engine, "restore_exposure", None)
+        if not callable(restore):
+            return 0.0
+        if getattr(self.engine, "event_exposure_usdc", None):
+            return 0.0  # the engine is already tracking exposure in this process
+        exposure = self.portfolio.exposure_by_event()
+        if not exposure:
+            return 0.0
+        total = float(restore(exposure))
+        logger.info(
+            "Exposure restored for %d event(s), %.2f USDC in total", len(exposure), total
+        )
+        return total
 
     def _fees_paid(self, fill: PaperFill) -> float | None:
         """Taker fees inside a fill's simulated cost (None when the simulator has no rate)."""

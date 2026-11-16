@@ -75,6 +75,9 @@ class PaperPortfolio:
     realized_pnl_usdc: float = 0.0
     fees_paid_usdc: float = 0.0
     settled_lots: int = 0
+    # Events confirmed closed: the risk manager stops counting them, even if a
+    # single-outcome lot is still waiting for its result.
+    closed_events: set[str] = field(default_factory=set)
     peak_equity_usdc: float = field(init=False)
     max_drawdown_usdc: float = 0.0
     _marks: dict[str, float] = field(default_factory=dict)  # token_id -> last usable best bid
@@ -194,6 +197,8 @@ class PaperPortfolio:
         realized = 0.0
         settled = 0
         awaiting = 0
+        if event_id:
+            self.closed_events.add(event_id)
         for lot in [candidate for candidate in self.open_lots if candidate.event_id == event_id]:
             if lot.is_arbitrage:
                 realized += self._close(lot, payout_usdc=lot.sets)
@@ -214,6 +219,19 @@ class PaperPortfolio:
             realized += self._close(lot, payout_usdc=payout)
             settled += 1
         return {"realized_pnl_usdc": realized, "settled_lots": settled}
+
+    def exposure_by_event(self) -> dict[str, float]:
+        """Money committed per event that is still open, fees included.
+
+        This is what the risk manager's per-event caps must see after a restart: the cost
+        of every open lot, grouped by event, leaving out events already confirmed closed.
+        """
+        exposure: dict[str, float] = {}
+        for lot in self.open_lots:
+            if not lot.event_id or lot.event_id in self.closed_events:
+                continue
+            exposure[lot.event_id] = exposure.get(lot.event_id, 0.0) + lot.cost_usdc
+        return exposure
 
     # ------------------------------------------------------------------ restart
 
