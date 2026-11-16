@@ -1,0 +1,93 @@
+name: record-session
+
+# Manual, short recording of real market data on a GitHub-hosted runner, for testing the
+# bot offline afterwards with `python -m paper_trader.replay`.
+#
+# Read-only: public GET requests and WebSocket reads, paper trading only, no secrets.
+# Meant for occasional test recordings, not for keeping the bot running.
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Minutes to record (1-30)"
+        required: true
+        default: "15"
+      discovery_limit:
+        description: "How many active events to follow (1-100)"
+        required: true
+        default: "20"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: record-session
+  cancel-in-progress: false
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # Inputs go through the environment, never straight into a shell line.
+      INPUT_MINUTES: ${{ inputs.minutes }}
+      INPUT_DISCOVERY_LIMIT: ${{ inputs.discovery_limit }}
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Validate inputs
+        run: |
+          case "$INPUT_MINUTES" in ''|*[!0-9]*) echo "minutes must be a whole number"; exit 1;; esac
+          case "$INPUT_DISCOVERY_LIMIT" in ''|*[!0-9]*) echo "discovery_limit must be a whole number"; exit 1;; esac
+          if [ "$INPUT_MINUTES" -lt 1 ] || [ "$INPUT_MINUTES" -gt 30 ]; then echo "minutes must be between 1 and 30"; exit 1; fi
+          if [ "$INPUT_DISCOVERY_LIMIT" -lt 1 ] || [ "$INPUT_DISCOVERY_LIMIT" -gt 100 ]; then echo "discovery_limit must be between 1 and 100"; exit 1; fi
+          echo "MINUTES=$INPUT_MINUTES" >> "$GITHUB_ENV"
+          echo "DISCOVERY_LIMIT=$INPUT_DISCOVERY_LIMIT" >> "$GITHUB_ENV"
+
+      - name: Check that the public endpoints answer from this runner
+        run: |
+          status=$(curl -sS -o /tmp/gamma.json -w '%{http_code}' --max-time 20 \
+            'https://gamma-api.polymarket.com/events?active=true&closed=false&limit=1' || echo "000")
+          echo "Gamma API answered with HTTP $status"
+          if [ "$status" != "200" ]; then
+            echo "The market data API is not reachable from this runner: nothing to record."
+            exit 1
+          fi
+          python -c "import json; rows = json.load(open('/tmp/gamma.json')); print('events in the sample:', len(rows) if isinstance(rows, list) else 'unexpected shape')"
+
+      - name: Record the session
+        run: |
+          mkdir -p logs
+          python -m paper_trader.record --minutes "$MINUTES" \
+            --out logs/session.jsonl --log logs/record_trades.jsonl
+
+      - name: Report on the paper trades made while recording
+        if: always()
+        run: |
+          if [ -f logs/record_trades.jsonl ]; then python -m paper_trader.report --log logs/record_trades.jsonl; fi
+          if [ -f logs/session.jsonl ]; then
+            echo "--- records by kind"
+            python -c "import collections, json; c = collections.Counter(json.loads(l).get('kind') for l in open('logs/session.jsonl', encoding='utf-8') if l.strip()); print(dict(c))"
+            ls -la logs/
+          fi
+
+      - name: Upload the recording
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: session-recording
+          path: |
+            logs/session.jsonl
+            logs/record_trades.jsonl
+          if-no-files-found: warn
+          retention-days: 7
