@@ -6,6 +6,7 @@ Read-only public market discovery (Paper Trading phase — no wallet keys or sig
 from __future__ import annotations
 
 import json
+import logging
 import math
 from typing import Any
 
@@ -13,7 +14,14 @@ import httpx
 
 from contracts.models import MarketGroup, MarketOutcome
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_GAMMA_URL = "https://gamma-api.polymarket.com"
+# Without an explicit order Gamma returns the oldest events first: long-running, thinly
+# traded ones. Ask for the most traded instead, and look at more candidates than we keep.
+DEFAULT_ORDER_BY = "volume24hr"
+DEFAULT_CANDIDATE_POOL_FACTOR = 5
+MAX_CANDIDATE_EVENTS = 500
 
 
 def _parse_bool(value: Any, *, default: bool) -> bool:
@@ -94,11 +102,16 @@ class GammaDiscoveryClient:
         min_liquidity_usdc: float = 0.0,
         timeout: float = 10.0,
         http_client: httpx.AsyncClient | None = None,
+        order_by: str | None = DEFAULT_ORDER_BY,
+        candidate_pool_factor: int = DEFAULT_CANDIDATE_POOL_FACTOR,
     ) -> None:
+        """`order_by=None` keeps the plain API order and returns every group found in `limit` events."""
         self.base_url = base_url.rstrip("/")
         self.min_liquidity_usdc = float(min_liquidity_usdc)
         self.timeout = float(timeout)
         self._http_client = http_client
+        self.order_by = (str(order_by).strip() or None) if order_by is not None else None
+        self.candidate_pool_factor = max(1, int(candidate_pool_factor))
 
     async def _get_json(self, url: str, params: dict[str, Any]) -> Any:
         """Execute a GET request reusing injected AsyncClient when present."""
@@ -124,18 +137,24 @@ class GammaDiscoveryClient:
         limit: int = 100,
         offset: int = 0,
         page_size: int = 100,
+        order: str | None = None,
+        ascending: bool = False,
     ) -> list[dict[str, Any]]:
-        """Fetch active, non-closed events from Gamma API with optional pagination."""
+        """Fetch active, non-closed events from Gamma API with optional pagination and ordering."""
         url = f"{self.base_url}/events"
         target_limit = max(1, int(limit))
         current_offset = max(0, int(offset))
         effective_page_size = max(1, int(page_size))
+        ordering: dict[str, Any] = (
+            {"order": order, "ascending": "true" if ascending else "false"} if order else {}
+        )
 
         if target_limit <= effective_page_size and current_offset == 0:
             params: dict[str, Any] = {
                 "active": "true",
                 "closed": "false",
                 "limit": target_limit,
+                **ordering,
             }
             return self._extract_event_rows(await self._get_json(url, params))
 
@@ -148,6 +167,7 @@ class GammaDiscoveryClient:
                 "closed": "false",
                 "limit": batch_limit,
                 "offset": current_offset,
+                **ordering,
             }
             rows = self._extract_event_rows(await self._get_json(url, params))
             if not rows:
@@ -306,10 +326,68 @@ class GammaDiscoveryClient:
 
         return groups
 
+    @staticmethod
+    def is_multi_outcome_arbitrage_group(group: MarketGroup) -> bool:
+        """True for an exhaustive group whose outcomes are separate markets.
+
+        The YES and NO books of one binary market mirror each other, so buying both always
+        costs 1 plus the spread. Only outcomes spread over several markets can sum below 1.
+        """
+        return bool(group.mutually_exclusive) and len({o.market_id for o in group.outcomes}) > 1
+
+    def rank_market_groups(
+        self, groups: list[MarketGroup], events_payload: list[dict[str, Any]]
+    ) -> list[MarketGroup]:
+        """Order groups: multi-outcome arbitrage candidates first, then by 24h volume."""
+        volume_by_event: dict[str, float] = {}
+        for event in events_payload:
+            if not isinstance(event, dict):
+                continue
+            event_id = str(event.get("id") or event.get("slug") or "").strip()
+            if event_id:
+                volume_by_event[event_id] = _safe_float(event.get("volume24hr")) or 0.0
+        return sorted(
+            groups,
+            key=lambda group: (
+                0 if self.is_multi_outcome_arbitrage_group(group) else 1,
+                -volume_by_event.get(group.event_id, 0.0),
+            ),
+        )
+
+    async def _fetch_candidate_events(self, pool_size: int) -> list[dict[str, Any]]:
+        """Fetch the candidate pool ordered by activity; fall back to the plain order if refused."""
+        try:
+            return await self.fetch_active_events(limit=pool_size, order=self.order_by)
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if not 400 <= status < 500:
+                raise
+            logger.warning(
+                "Gamma refused order=%s (HTTP %s); falling back to its default order.", self.order_by, status
+            )
+            return await self.fetch_active_events(limit=pool_size)
+
     async def discover_market_groups(self, limit: int = 100) -> list[MarketGroup]:
-        """Fetch active Gamma events and parse them into MarketGroup objects."""
-        events = await self.fetch_active_events(limit=limit)
-        return self.parse_market_groups(events)
+        """Discover up to `limit` MarketGroup objects among the most traded active events."""
+        target = max(1, int(limit))
+        if not self.order_by:
+            events = await self.fetch_active_events(limit=target)
+            return self.parse_market_groups(events)
+
+        pool_size = min(MAX_CANDIDATE_EVENTS, target * self.candidate_pool_factor)
+        events = await self._fetch_candidate_events(max(target, pool_size))
+        ranked = self.rank_market_groups(self.parse_market_groups(events), events)
+        selected = ranked[:target]
+        logger.info(
+            "Gamma discovery: %d events looked at, %d usable groups (%d multi-outcome arbitrage candidates); "
+            "following %d (%d multi-outcome arbitrage candidates).",
+            len(events),
+            len(ranked),
+            sum(self.is_multi_outcome_arbitrage_group(group) for group in ranked),
+            len(selected),
+            sum(self.is_multi_outcome_arbitrage_group(group) for group in selected),
+        )
+        return selected
 
 
 async def discover_active_market_groups(
@@ -317,11 +395,15 @@ async def discover_active_market_groups(
     limit: int = 100,
     min_liquidity_usdc: float = 0.0,
     http_client: httpx.AsyncClient | None = None,
+    order_by: str | None = DEFAULT_ORDER_BY,
+    candidate_pool_factor: int = DEFAULT_CANDIDATE_POOL_FACTOR,
 ) -> list[MarketGroup]:
     """Convenience helper to discover active MarketGroup instances in one call."""
     client = GammaDiscoveryClient(
         base_url=base_url,
         min_liquidity_usdc=min_liquidity_usdc,
         http_client=http_client,
+        order_by=order_by,
+        candidate_pool_factor=candidate_pool_factor,
     )
     return await client.discover_market_groups(limit=limit)

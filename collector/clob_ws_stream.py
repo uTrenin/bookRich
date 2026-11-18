@@ -89,6 +89,7 @@ class ClobOrderBookStream:
         ws_connect: Callable[..., Any] | None = None,
     ) -> None:
         self.token_ids = list(dict.fromkeys(str(tid).strip() for tid in token_ids if str(tid).strip()))
+        self._tracked_tokens: set[str] = set(self.token_ids)
         self.rest_url = rest_url.rstrip("/")
         self.ws_url = ws_url
         self.ping_interval_sec = float(ping_interval_sec)
@@ -309,6 +310,10 @@ class ClobOrderBookStream:
         updated: dict[str, OrderBookSnapshot] = {}
         for token_id, deltas in changes_by_token.items():
             existing = self._books.get(token_id)
+            if existing is None and token_id not in self._tracked_tokens:
+                # Every price_change also carries the complementary token of the same market
+                # (the NO side of a YES we follow). It is not ours: nothing was missed.
+                continue
             if existing is None or existing.is_stale:
                 # A delta is only meaningful on top of a known-good snapshot. Applying it to a
                 # missing book would create a one-level book, and applying it to a stale book
@@ -408,7 +413,10 @@ class ClobOrderBookStream:
 
     @property
     def ignored_delta_count(self) -> int:
-        """Number of price_change deltas skipped because no fresh snapshot was available."""
+        """Deltas for tokens we follow that were skipped because no fresh snapshot was available.
+
+        Deltas for tokens we do not follow are not counted: they are not lost updates.
+        """
         return self._ignored_deltas
 
     def get_all_books(self, now: datetime | None = None) -> dict[str, OrderBookSnapshot]:
@@ -440,6 +448,7 @@ class ClobOrderBookStream:
             return []
 
         self.token_ids = normalized
+        self._tracked_tokens = set(normalized)
         for tid in removed:
             self._books.pop(tid, None)
 

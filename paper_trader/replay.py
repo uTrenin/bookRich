@@ -21,7 +21,11 @@ from typing import Any, Callable
 import httpx
 
 from collector.clob_ws_stream import ClobOrderBookStream
-from collector.gamma_discovery import GammaDiscoveryClient
+from collector.gamma_discovery import (
+    DEFAULT_CANDIDATE_POOL_FACTOR,
+    DEFAULT_ORDER_BY,
+    GammaDiscoveryClient,
+)
 from paper_trader.logger import PaperTradeLogger
 from paper_trader.report import analyze_paper_log, format_report
 from paper_trader.runner import EngineProtocol, PaperTradingRunner, validate_paper_only_safety
@@ -35,6 +39,8 @@ async def build_runner(
     log_path: str | Path,
     discovery_limit: int = 50,
     min_liquidity_usdc: float = 0.0,
+    discovery_order: str | None = DEFAULT_ORDER_BY,
+    discovery_pool_factor: int = DEFAULT_CANDIDATE_POOL_FACTOR,
     engine: EngineProtocol | None = None,
     max_backoff_sec: float = 60.0,
     receive_timeout_sec: float | None = None,
@@ -46,7 +52,12 @@ async def build_runner(
     Recording and replay both go through this function, so they issue the same requests
     in the same order: one discovery here to learn the tokens, then the runner's own.
     """
-    discovery = GammaDiscoveryClient(min_liquidity_usdc=min_liquidity_usdc, http_client=http_client)
+    discovery = GammaDiscoveryClient(
+        min_liquidity_usdc=min_liquidity_usdc,
+        http_client=http_client,
+        order_by=discovery_order,
+        candidate_pool_factor=discovery_pool_factor,
+    )
     groups = await discovery.discover_market_groups(limit=discovery_limit)
     token_ids = list(dict.fromkeys(outcome.token_id for group in groups for outcome in group.outcomes))
     stream = ClobOrderBookStream(
@@ -85,6 +96,10 @@ async def replay_session(
     min_liquidity = float(
         min_liquidity_usdc if min_liquidity_usdc is not None else config.get("min_liquidity_usdc", 0.0)
     )
+    # Recordings made before discovery ordering existed carry no such setting: they were
+    # made with the plain API order, and must be replayed the same way.
+    order = config.get("discovery_order")
+    pool_factor = int(config.get("discovery_pool_factor", 1) or 1)
 
     async with httpx.AsyncClient(transport=replay.http_transport()) as client:
         try:
@@ -94,6 +109,8 @@ async def replay_session(
                 log_path=log_path,
                 discovery_limit=limit,
                 min_liquidity_usdc=min_liquidity,
+                discovery_order=str(order) if order else None,
+                discovery_pool_factor=pool_factor,
                 engine=engine,
                 max_backoff_sec=0.01,
                 heartbeat_interval_sec=3600.0,

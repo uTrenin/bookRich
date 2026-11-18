@@ -23,6 +23,7 @@ from typing import Any, Callable
 import httpx
 import websockets
 
+from collector.gamma_discovery import DEFAULT_CANDIDATE_POOL_FACTOR, DEFAULT_ORDER_BY
 from paper_trader.replay import build_runner
 from paper_trader.runner import EngineProtocol, validate_paper_only_safety
 from paper_trader.session_io import RecordingTransport, SessionRecorder, record_assessments, recording_connector
@@ -37,6 +38,8 @@ async def record_session(
     log_path: str | Path,
     discovery_limit: int = 50,
     min_liquidity_usdc: float = 0.0,
+    discovery_order: str | None = DEFAULT_ORDER_BY,
+    discovery_pool_factor: int = DEFAULT_CANDIDATE_POOL_FACTOR,
     news_feed_urls: list[str] | None = None,
     engine: EngineProtocol | None = None,
     inner_transport: httpx.AsyncBaseTransport | None = None,
@@ -47,7 +50,14 @@ async def record_session(
     validate_paper_only_safety()
     recorder = SessionRecorder(out_path)
     recorder.write(
-        {"kind": "config", "discovery_limit": int(discovery_limit), "min_liquidity_usdc": float(min_liquidity_usdc)}
+        {
+            "kind": "config",
+            "discovery_limit": int(discovery_limit),
+            "min_liquidity_usdc": float(min_liquidity_usdc),
+            # A replay must ask for the markets the same way, or the recorded answers do not line up.
+            "discovery_order": discovery_order,
+            "discovery_pool_factor": int(discovery_pool_factor),
+        }
     )
     transport = RecordingTransport(inner_transport or httpx.AsyncHTTPTransport(), recorder)
     stop = stop_event if stop_event is not None else asyncio.Event()
@@ -59,6 +69,8 @@ async def record_session(
             log_path=log_path,
             discovery_limit=discovery_limit,
             min_liquidity_usdc=min_liquidity_usdc,
+            discovery_order=discovery_order,
+            discovery_pool_factor=discovery_pool_factor,
             engine=engine,
             receive_timeout_sec=30.0,
             news_feed_urls=news_feed_urls,
