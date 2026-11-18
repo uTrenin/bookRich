@@ -103,7 +103,8 @@ def test_ws_delta_never_refreshes_a_stale_or_missing_book() -> None:
     # A delta for a token that never had a snapshot must not create a one-level book.
     assert stream.apply_ws_message(_delta("never-seen", "0.10", "3"), now=T0) == []
     assert stream.get_book("never-seen", now=T0) is None
-    assert stream.ignored_delta_count == 2
+    # Only the delta for the token we follow counts as ignored: the other one is not ours.
+    assert stream.ignored_delta_count == 1
 
     # Only a full `book` snapshot makes the book fresh again; deltas then apply normally.
     stream.apply_ws_message(_book_event("tok", ask="0.52"), now=T0)
@@ -497,10 +498,11 @@ async def test_runner_throttles_identical_risk_rejections(tmp_path: Path) -> Non
 
 
 def test_runner_heartbeat_reports_feed_health(tmp_path: Path) -> None:
-    stream = ClobOrderBookStream(token_ids=["tok"])
+    stream = ClobOrderBookStream(token_ids=["tok", "no-snapshot-yet"])
     stream.apply_ws_message(_book_event("tok"), now=T0)
     stream.apply_ws_message(_delta("tok", "0.6", "1", timestamp=T0 - timedelta(seconds=4)), now=T0)
-    stream.apply_ws_message(_delta("unknown", "0.6", "1"), now=T0)
+    stream.apply_ws_message(_delta("no-snapshot-yet", "0.6", "1"), now=T0)  # ours, but no book yet
+    stream.apply_ws_message(_delta("not-followed", "0.6", "1"), now=T0)  # not ours: not counted
 
     runner = _runner(tmp_path, engine=_StubEngine(), book_stream=stream)
     stats = runner.get_heartbeat_stats()

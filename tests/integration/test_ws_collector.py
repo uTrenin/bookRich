@@ -258,6 +258,7 @@ async def test_gamma_discovery_negrisk_binary_and_filtering() -> None:
             limit=50,
             min_liquidity_usdc=200.0,
             http_client=client,
+            order_by=None,  # this test is about the parsing rules, in the order the API answers
         )
 
     assert len(captured_requests) == 1
@@ -375,13 +376,14 @@ async def test_gamma_discovery_wrapped_data_fallback_labels_and_malformed_liquid
 
     transport = httpx.MockTransport(lambda _: httpx.Response(200, json=payload))
     async with httpx.AsyncClient(transport=transport) as client:
-        strict_client = GammaDiscoveryClient(min_liquidity_usdc=10.0, http_client=client)
+        # order_by=None: parsing rules only, in the order the API answers.
+        strict_client = GammaDiscoveryClient(min_liquidity_usdc=10.0, http_client=client, order_by=None)
         strict_groups = await strict_client.discover_market_groups()
         assert len(strict_groups) == 1
         assert strict_groups[0].event_id == "evt_fallback_question"
         assert [o.outcome_label for o in strict_groups[0].outcomes] == ["Option Alpha?", "Option Beta?"]
 
-        permissive_client = GammaDiscoveryClient(min_liquidity_usdc=0.0, http_client=client)
+        permissive_client = GammaDiscoveryClient(min_liquidity_usdc=0.0, http_client=client, order_by=None)
         permissive_groups = await permissive_client.discover_market_groups()
         assert [g.event_id for g in permissive_groups] == ["evt_wrapped", "evt_fallback_question"]
 
