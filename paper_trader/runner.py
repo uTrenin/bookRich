@@ -13,7 +13,7 @@ import os
 import signal as signal_mod
 import time
 from pathlib import Path
-from typing import Any, Callable, Protocol, runtime_checkable
+from typing import Any, Callable, Iterator, Mapping, Protocol, runtime_checkable
 
 from collector.clob_ws_stream import ClobOrderBookStream
 from collector.gamma_discovery import GammaDiscoveryClient
@@ -50,7 +50,7 @@ class EngineProtocol(Protocol):
     """Protocol decoupling /paper_trader from Recinto 2 (/engine)."""
 
     def evaluate_group(
-        self, group: MarketGroup, books: dict[str, OrderBookSnapshot]
+        self, group: MarketGroup, books: Mapping[str, OrderBookSnapshot]
     ) -> TradeSignal | None:
         ...
 
@@ -60,9 +60,76 @@ class EngineProtocol(Protocol):
         ...
 
     def approve_signal(
-        self, signal: TradeSignal, books: dict[str, OrderBookSnapshot]
+        self, signal: TradeSignal, books: Mapping[str, OrderBookSnapshot]
     ) -> tuple[bool, str]:
         ...
+
+
+class _LiveBooks(Mapping[str, OrderBookSnapshot]):
+    """Order books for one evaluation, read from the stream only when asked for.
+
+    Copying every tracked book on each update made the cost of one update grow with the
+    number of books followed (540 books: the bot fell behind the feed and lost the
+    connection). Here a lookup reads one book, and the full copy happens only when
+    someone walks the whole mapping (the portfolio marks, after a fill).
+
+    A book read once stays the same for the whole evaluation, so the engine, the risk
+    check and the simulator all price the same book.
+    """
+
+    __slots__ = ("_read_one", "_read_all", "_seen", "_complete")
+
+    def __init__(
+        self,
+        read_one: Callable[[str], OrderBookSnapshot | None],
+        read_all: Callable[[], dict[str, OrderBookSnapshot]],
+        pinned: Mapping[str, OrderBookSnapshot] | None = None,
+    ) -> None:
+        self._read_one = read_one
+        self._read_all = read_all
+        self._seen: dict[str, OrderBookSnapshot | None] = dict(pinned) if pinned else {}
+        self._complete = False
+
+    def _lookup(self, token_id: object) -> OrderBookSnapshot | None:
+        try:
+            return self._seen[token_id]  # type: ignore[index]
+        except KeyError:
+            pass
+        except TypeError:  # unhashable key: not a token
+            return None
+        if self._complete or not isinstance(token_id, str):
+            return None
+        book = self._read_one(token_id)
+        self._seen[token_id] = book
+        return book
+
+    def _load_all(self) -> dict[str, OrderBookSnapshot | None]:
+        if not self._complete:
+            already_read = {tid: book for tid, book in self._seen.items() if book is not None}
+            everything: dict[str, OrderBookSnapshot | None] = dict(self._read_all())
+            everything.update(already_read)
+            self._seen = everything
+            self._complete = True
+        return self._seen
+
+    def __getitem__(self, token_id: str) -> OrderBookSnapshot:
+        book = self._lookup(token_id)
+        if book is None:
+            raise KeyError(token_id)
+        return book
+
+    def get(self, token_id: object, default: Any = None) -> Any:
+        book = self._lookup(token_id)
+        return default if book is None else book
+
+    def __contains__(self, token_id: object) -> bool:
+        return self._lookup(token_id) is not None
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._load_all())
+
+    def __len__(self) -> int:
+        return len(self._load_all())
 
 
 def _optional_float_env(name: str) -> float | None:
@@ -547,6 +614,8 @@ class PaperTradingRunner:
 
     def get_heartbeat_stats(self) -> dict[str, Any]:
         """Return a snapshot of runtime paper-trading counters."""
+        # Book updates no longer copy every book: refresh them here for the marks below.
+        self._sync_books_from_stream()
         stats: dict[str, Any] = {
             **self._stats,
             "paper_only": PAPER_ONLY,
@@ -632,15 +701,44 @@ class PaperTradingRunner:
         self.trade_logger.log_signal_rejected(signal, reason)
 
     def _sync_books_from_stream(self) -> None:
+        """Copy every book of the stream into the local cache (one copy per tracked book).
+
+        Too expensive to run on each book update: the hot path reads single books through
+        `_live_books`. Used for the heartbeat and the summaries, which need all the marks.
+        """
         if self.book_stream is not None and hasattr(self.book_stream, "get_all_books"):
             stream_books = self.book_stream.get_all_books()
             if isinstance(stream_books, dict):
                 self._books.update(stream_books)
 
+    def _read_book(self, token_id: str) -> OrderBookSnapshot | None:
+        """Current book of one token: the stream's (staleness included), else the cached one."""
+        get_book = getattr(self.book_stream, "get_book", None)
+        if callable(get_book):
+            book = get_book(token_id)
+            if isinstance(book, OrderBookSnapshot):
+                self._books[token_id] = book
+                return book
+        return self._books.get(token_id)
+
+    def _read_all_books(self) -> dict[str, OrderBookSnapshot]:
+        self._sync_books_from_stream()
+        return self._books
+
+    def _live_books(
+        self, pinned: Mapping[str, OrderBookSnapshot] | None = None
+    ) -> Mapping[str, OrderBookSnapshot]:
+        """Books for one evaluation; `pinned` entries win over what the stream holds."""
+        if self.book_stream is not None and not callable(
+            getattr(self.book_stream, "get_book", None)
+        ):
+            # A stream that cannot hand out single books: copy everything, as before.
+            self._sync_books_from_stream()
+        return _LiveBooks(self._read_book, self._read_all_books, pinned)
+
     async def handle_book_update(self, snapshot: OrderBookSnapshot) -> list[PaperFill]:
         """Evaluate affected market groups upon an L2 order-book update."""
         async with self._eval_lock:
-            self._sync_books_from_stream()
             self._books[snapshot.token_id] = snapshot
             self._stats["book_updates"] += 1
 
@@ -651,7 +749,8 @@ class PaperTradingRunner:
             if not affected_groups:
                 return []
 
-            books_view = dict(self._books)
+            # Nothing below awaits, so every book read here belongs to the same instant.
+            books_view = self._live_books({snapshot.token_id: snapshot})
             fills: list[PaperFill] = []
 
             for group in affected_groups:
@@ -705,21 +804,10 @@ class PaperTradingRunner:
     async def handle_news_assessment(self, assessment: NewsAssessment) -> PaperFill | None:
         """Evaluate a classified news event against the current target order book."""
         async with self._eval_lock:
-            self._sync_books_from_stream()
             self._stats["news_assessments"] += 1
 
-            book = self._books.get(assessment.target_token_id)
-            if (
-                book is None
-                and self.book_stream is not None
-                and hasattr(self.book_stream, "get_book")
-            ):
-                maybe_book = self.book_stream.get_book(assessment.target_token_id)
-                if isinstance(maybe_book, OrderBookSnapshot):
-                    book = maybe_book
-                    self._books[assessment.target_token_id] = book
-
-            books_view = dict(self._books)
+            books_view = self._live_books()
+            book = books_view.get(assessment.target_token_id)
             matched_groups = self._groups_by_token.get(assessment.target_token_id, [])
             resolved_event_id = matched_groups[0].event_id if matched_groups else None
             signal = self._call_evaluate_news(assessment, book, event_id=resolved_event_id)
@@ -808,6 +896,7 @@ class PaperTradingRunner:
             return None
         prev_date = self._last_summary_utc_date
         self._last_summary_utc_date = current_utc_date
+        self._sync_books_from_stream()
         summary = self.trade_logger.generate_daily_summary(
             date_str=prev_date, write_to_log=True, portfolio=self.portfolio.snapshot(self._books)
         )
@@ -1027,6 +1116,7 @@ class PaperTradingRunner:
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             if self.daily_summary_enabled and self.write_summary_on_shutdown:
+                self._sync_books_from_stream()
                 self.trade_logger.generate_daily_summary(
                     date_str=self._last_summary_utc_date,
                     write_to_log=True,

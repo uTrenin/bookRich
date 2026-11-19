@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from datetime import datetime, timezone
+from typing import Mapping
 
 from contracts.models import BookLevel, OrderBookSnapshot, OrderLeg, PaperFill, TradeSignal
 
@@ -28,7 +29,7 @@ class PaperOrderSimulator:
     def simulate_signal(
         self,
         signal: TradeSignal,
-        books: dict[str, OrderBookSnapshot],
+        books: Mapping[str, OrderBookSnapshot],
         executed_at: datetime | None = None,
     ) -> PaperFill:
         """Walk real L2 ask/bid levels to compute VWAP, cost, and slippage for a signal."""
