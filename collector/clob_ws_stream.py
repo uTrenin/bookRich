@@ -25,6 +25,16 @@ logger = logging.getLogger(__name__)
 DEFAULT_CLOB_REST_URL = "https://clob.polymarket.com"
 DEFAULT_CLOB_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
+# The first message after subscribing carries the book of every followed token at once:
+# about 1.1 MB for 540 tokens on 2026-11-19, over the 1 MiB default of `websockets`, which
+# then closed the connection (code 1009) on every reconnect. Still bounded, never unlimited.
+DEFAULT_WS_MAX_MESSAGE_BYTES = 16 * 1024 * 1024
+
+
+def default_ws_connect(url: str, *, max_size: int = DEFAULT_WS_MAX_MESSAGE_BYTES) -> Any:
+    """`websockets.connect` with a message size limit large enough for the initial book dump."""
+    return websockets.connect(url, max_size=max_size)
+
 
 def _ensure_utc(dt: datetime) -> datetime:
     """Normalize a datetime to timezone-aware UTC."""
@@ -628,7 +638,7 @@ class ClobOrderBookStream:
             # Per-token failures are logged, never raised: the reconnect loop must always start.
             await self.initialize_books()
 
-        connector = ws_connect or self._ws_connect or websockets.connect
+        connector = ws_connect or self._ws_connect or default_ws_connect
         backoff = 1.0
         self._reconnect_event = asyncio.Event()
 
