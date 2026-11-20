@@ -21,8 +21,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 import httpx
-import websockets
 
+from collector.clob_ws_stream import default_ws_connect
 from collector.gamma_discovery import DEFAULT_CANDIDATE_POOL_FACTOR, DEFAULT_ORDER_BY
 from paper_trader.replay import build_runner
 from paper_trader.runner import EngineProtocol, validate_paper_only_safety
@@ -65,7 +65,7 @@ async def record_session(
     async with httpx.AsyncClient(transport=transport, timeout=10.0) as client:
         runner = await build_runner(
             http_client=client,
-            ws_connect=recording_connector(inner_connector or websockets.connect, recorder),
+            ws_connect=recording_connector(inner_connector or default_ws_connect, recorder),
             log_path=log_path,
             discovery_limit=discovery_limit,
             min_liquidity_usdc=min_liquidity_usdc,
